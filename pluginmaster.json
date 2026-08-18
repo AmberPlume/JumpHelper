@@ -1,0 +1,26 @@
+[
+  {
+    "Author": "AmberPlume",
+    "Name": "跳跳乐助手",
+    "Punchline": "我才不要从0开始",
+    "Description": "可以记录玩家的跳跃路线，并进行回放，从而达到类似读档的效果。也可以直接加载其他玩家分享的路线。允许段落编辑，重录某段特定的段落。当前为初步测试版本，欢迎在discord内反馈。",
+    "InternalName": "JumpHelper",
+    "AssemblyVersion": "0.1.0.0",
+    "TestingAssemblyVersion": "0.1.0.0",
+    "DalamudApiLevel": 15,
+    "TestingDalamudApiLevel": 15,
+    "ApplicableVersion": "any",
+    "DownloadLinkInstall": "https://github.com/AmberPlume/JumpHelper/releases/download/v0.1.0.0/JumpHelper-v0.1.0.0.zip",
+    "DownloadLinkTesting": "https://github.com/AmberPlume/JumpHelper/releases/download/v0.1.0.0/JumpHelper-v0.1.0.0.zip",
+    "DownloadLinkUpdate": "https://github.com/AmberPlume/JumpHelper/releases/download/v0.1.0.0/JumpHelper-v0.1.0.0.zip",
+    "IconUrl": "",
+    "Changelog": "v0.1.0.0\n【首次发布】\n- 录制玩家真实跳跃（全量输入时间线），读档逐段回放，实现「读档」效果\n- 支持加载其他玩家分享的路线（剪贴板导入/导出）\n- 段落编辑：重录某段、截断、删除\n- 移动状态自动匹配（冲刺/慢跑/速行/慢走）与自动施放\n- 世界标记显示路线路径与段序号\n- 悬浮窗标定跳跃工具\n- 当前为初步测试版本，欢迎反馈",
+    "Tags": [
+      "Movement",
+      "Jump",
+      "Utility"
+    ],
+    "RepoUrl": "https://github.com/AmberPlume/JumpHelper",
+    "AcceptsFeedback": true
+  }
+]

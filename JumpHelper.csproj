@@ -1,0 +1,17 @@
+<Project Sdk="Dalamud.CN.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <AssemblyName>JumpHelper</AssemblyName>
+    <Version>0.1.0.0</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <PackageProjectUrl>https://github.com/AmberPlume</PackageProjectUrl>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>preview</LangVersion>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Optimize>True</Optimize>
+    <UseWindowsForms>true</UseWindowsForms>
+    <NoWarn>1701;1702;CS8601;CS8602;CS8603;CS8604;CS8618;CS8625;CS8509;CS0162;IDE1006;IDE0300;CS0649;CS0414</NoWarn>
+  </PropertyGroup>
+</Project>
