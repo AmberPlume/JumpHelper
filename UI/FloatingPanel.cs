@@ -985,9 +985,9 @@ public sealed class FloatingPanel : Window
     {
         ImGui.Spacing();
 
-        // 云端清单缓存：每秒触发一次【后台线程】拉取（Task.Run），UI 线程不阻塞——
-        // 同步 HTTP 即使每秒一次也会卡帧（实测帧数掉），异步后帧率完全不受影响。
-        if (Environment.TickCount64 - _cloudLastRefresh > 1000 && !_cloudLoading)
+        // 云端清单缓存：每 5 秒触发一次【后台线程】拉取（Task.Run），UI 线程不阻塞。
+        // 走云函数 /list 后降低频率（数据不常变，省函数配额）；上传/删除成功仍立即刷新。
+        if (Environment.TickCount64 - _cloudLastRefresh > 5000 && !_cloudLoading)
         {
             _cloudLastRefresh = Environment.TickCount64;
             _cloudLoading = true;

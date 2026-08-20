@@ -36,6 +36,23 @@ public class CloudUploadResult
     [JsonPropertyName("del_token")] public string? DelToken { get; set; }
 }
 
+/// <summary>云端清单响应（函数 /list）。</summary>
+public class CloudListResult
+{
+    [JsonPropertyName("ok")] public bool Ok { get; set; }
+    [JsonPropertyName("routes")] public List<CloudRouteInfo> Routes { get; set; } = new();
+    [JsonPropertyName("error")] public string? Error { get; set; }
+}
+
+/// <summary>云端下载响应（函数 /download）。</summary>
+public class CloudDownloadResult
+{
+    [JsonPropertyName("ok")] public bool Ok { get; set; }
+    [JsonPropertyName("name")] public string? Name { get; set; }
+    [JsonPropertyName("json_text")] public string? JsonText { get; set; }
+    [JsonPropertyName("error")] public string? Error { get; set; }
+}
+
 /// <summary>
 /// 云端路线服务（腾讯云 COS + SCF 云函数审核）：
 /// 列表/下载 = COS 公有读（GET，无需鉴权）；
@@ -55,6 +72,11 @@ public static class CloudRouteService
     private const string CloudFeedbackUrl = "https://1324136629-gsbdghqpx0.ap-shanghai.tencentscf.com/feedback";
     private const string CloudSuggestUrl = "https://1324136629-gsbdghqpx0.ap-shanghai.tencentscf.com/suggest";
     private const string CloudDeleteUrl = "https://1324136629-gsbdghqpx0.ap-shanghai.tencentscf.com/delete";
+    // 列表/下载也走云函数域名（tencentscf.com）：玩家加速器/代理规则可能放行函数域名但未放行
+    // COS 域名（myqcloud.com）→ 直连 COS 列表/下载会失败（实测：能上传但列表空）。统一走函数后
+    // 玩家只要能上传就必然能看列表/下载。
+    private const string CloudListUrl = "https://1324136629-gsbdghqpx0.ap-shanghai.tencentscf.com/list";
+    private const string CloudDownloadUrl = "https://1324136629-gsbdghqpx0.ap-shanghai.tencentscf.com/download";
 
     /// <summary>恒可用（上传走云函数，无需本地密钥）。</summary>
     public static bool IsConfigured => true;
@@ -85,26 +107,42 @@ public static class CloudRouteService
         return p.Length == 0 ? "" : p + "/";
     }
 
+    /// <summary>按区域 ID 查地图名（TerritoryName 缺失的路线上传时解析用）；查询失败返回 null。</summary>
+    private static string? ResolveMapName(uint territoryId)
+    {
+        try
+        {
+            var row = Service.DataManager.GetExcelSheet<Lumina.Excel.Sheets.TerritoryType>()?.GetRow(territoryId);
+            return row?.PlaceName.ValueNullable?.Name.ToString();
+        }
+        catch (Exception ex)
+        {
+            Service.Log.Error(ex, $"CloudRouteService: 地图名查询失败 Territory={territoryId}");
+            return null;
+        }
+    }
+
     /// <summary>对象 key 的 URL 编码（逐段编码，保留 /；下载用）。</summary>
     private static string EncodeKey(string key)
         => string.Join("/", key.Split('/').Select(Uri.EscapeDataString));
 
-    /// <summary>拉取云端路线清单（含上传人/描述）：GET index.json。
-    /// 返回 null = 拉取失败（调用方保留旧缓存并提示）；空列表 = 桶空（404）。</summary>
+    /// <summary>拉取云端路线清单（含上传人/描述）：POST 云函数 /list（函数读 index.json 返回，
+    /// 与上传同域名——玩家网络对 COS 直连失败时列表仍可用）。
+    /// 返回 null = 拉取失败（调用方保留旧缓存并提示）；空列表 = 桶空。</summary>
     public static List<CloudRouteInfo>? ListRouteInfos()
     {
         try
         {
-            var url = $"{CloudBucketBase.TrimEnd('/')}/{NormalizedPrefix()}index.json";
-            using var resp = Http.GetAsync(url).GetAwaiter().GetResult();
+            using var req = new HttpRequestMessage(HttpMethod.Post, CloudListUrl);
+            req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+            using var resp = Http.SendAsync(req).GetAwaiter().GetResult();
             if (resp.IsSuccessStatusCode)
             {
                 var text = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                return JsonSerializer.Deserialize<List<CloudRouteInfo>>(text, JsonOpts);
-                // 云端清单每秒后台拉取，成功不记日志（防 jump.log 刷屏）
+                var result = JsonSerializer.Deserialize<CloudListResult>(text, JsonOpts);
+                return result?.Ok == true ? result.Routes : null;
+                // 云端清单周期性后台拉取，成功不记日志（防 jump.log 刷屏）
             }
-            if ((int)resp.StatusCode == 404)
-                return new List<CloudRouteInfo>(); // 空桶（尚无路线）
             PluginLog.Error($"CloudRouteService: 云端清单拉取失败 HTTP {(int)resp.StatusCode}");
         }
         catch (Exception ex)
@@ -114,22 +152,31 @@ public static class CloudRouteService
         return null; // 失败
     }
 
-    /// <summary>下载并解析云端路线：GET 路线 JSON → RouteFile（与本地路线 JSON 同格式）。</summary>
+    /// <summary>下载并解析云端路线：POST 云函数 /download（函数读路线文件返回，与列表同域名）。</summary>
     public static RouteFile? DownloadRoute(string name)
     {
         try
         {
-            var key = NormalizedPrefix() + EncodeKey(name) + ".json";
-            var url = $"{CloudBucketBase.TrimEnd('/')}/{key}";
-            using var resp = Http.GetAsync(url).GetAwaiter().GetResult();
+            var payload = JsonSerializer.Serialize(new Dictionary<string, object?> { ["name"] = name }, JsonOpts);
+            using var req = new HttpRequestMessage(HttpMethod.Post, CloudDownloadUrl);
+            req.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+            using var resp = Http.SendAsync(req).GetAwaiter().GetResult();
             if (resp.IsSuccessStatusCode)
             {
                 var text = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                var route = JsonSerializer.Deserialize<RouteFile>(text, JsonOpts);
-                PluginLog.Info($"CloudRouteService: 云端路线「{name}」下载成功（{text.Length} 字节）");
-                return route;
+                var result = JsonSerializer.Deserialize<CloudDownloadResult>(text, JsonOpts);
+                if (result?.Ok == true && !string.IsNullOrWhiteSpace(result.JsonText))
+                {
+                    var route = JsonSerializer.Deserialize<RouteFile>(result.JsonText, JsonOpts);
+                    PluginLog.Info($"CloudRouteService: 云端路线「{name}」下载成功");
+                    return route;
+                }
+                PluginLog.Error($"CloudRouteService: 云端路线「{name}」下载被拒: {result?.Error ?? text}");
             }
-            PluginLog.Error($"CloudRouteService: 云端路线「{name}」下载失败 HTTP {(int)resp.StatusCode}");
+            else
+            {
+                PluginLog.Error($"CloudRouteService: 云端路线「{name}」下载失败 HTTP {(int)resp.StatusCode}");
+            }
         }
         catch (Exception ex)
         {
@@ -145,9 +192,11 @@ public static class CloudRouteService
         try
         {
             var jsonText = JsonSerializer.Serialize(route, JsonOpts);
+            // 地图名：路线文件没存 TerritoryName（旧版录制/导入的路线）时，上传现场用 TerritoryId 查
+            // 游戏数据解析真名——避免云端列表显示"地图 137"这种 ID。查询失败才兜底 ID。
             var map = !string.IsNullOrWhiteSpace(route.TerritoryName)
                 ? route.TerritoryName
-                : $"地图 {route.TerritoryId}";
+                : ResolveMapName(route.TerritoryId) ?? $"地图 {route.TerritoryId}";
             var mode = route.SegmentMode == SegmentMode.Fragment ? "碎片" : "线性";
             var payload = JsonSerializer.Serialize(new Dictionary<string, object?>
             {

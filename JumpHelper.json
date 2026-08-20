@@ -4,7 +4,7 @@
   "Punchline": "我才不要从0开始",
   "Description": "可以记录玩家的跳跃路线，并进行回放，从而达到类似读档的效果。也可以直接加载其他玩家分享的路线。允许段落编辑，重录某段特定的段落。当前为初步测试版本，欢迎在discord内反馈。",
   "InternalName": "JumpHelper",
-  "AssemblyVersion": "0.3.0.1",
+  "AssemblyVersion": "0.3.0.2",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
   "IconUrl": "",

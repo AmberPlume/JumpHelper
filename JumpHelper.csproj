@@ -1,9 +1,9 @@
 <Project Sdk="Dalamud.CN.NET.Sdk/15.0.0">
   <PropertyGroup>
     <AssemblyName>JumpHelper</AssemblyName>
-    <Version>0.3.0.1</Version>
-    <AssemblyVersion>0.3.0.1</AssemblyVersion>
-    <FileVersion>0.3.0.1</FileVersion>
+    <Version>0.3.0.2</Version>
+    <AssemblyVersion>0.3.0.2</AssemblyVersion>
+    <FileVersion>0.3.0.2</FileVersion>
     <PackageProjectUrl>https://github.com/AmberPlume</PackageProjectUrl>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
