@@ -62,7 +62,14 @@ public static class CloudRouteService
     /// <summary>恒可用（上传走云函数，无需本地密钥）。</summary>
     public static bool IsUploadReady => true;
 
-    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(30) };
+    private static readonly HttpClient Http = new(new HttpClientHandler
+    {
+        // 国内直连 COS/云函数，绝不走系统代理——玩家可能开加速器/Clash，代理会把
+        // 腾讯云域名请求带偏导致超时/失败（实测其他玩家云端列表空即此因）。
+        UseProxy = false,
+        AutomaticDecompression = System.Net.DecompressionMethods.All
+    })
+    { Timeout = TimeSpan.FromSeconds(10) };
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -82,10 +89,10 @@ public static class CloudRouteService
     private static string EncodeKey(string key)
         => string.Join("/", key.Split('/').Select(Uri.EscapeDataString));
 
-    /// <summary>拉取云端路线清单（含上传人/描述）：GET index.json，404（空桶）返回空列表。</summary>
-    public static List<CloudRouteInfo> ListRouteInfos()
+    /// <summary>拉取云端路线清单（含上传人/描述）：GET index.json。
+    /// 返回 null = 拉取失败（调用方保留旧缓存并提示）；空列表 = 桶空（404）。</summary>
+    public static List<CloudRouteInfo>? ListRouteInfos()
     {
-        var list = new List<CloudRouteInfo>();
         try
         {
             var url = $"{CloudBucketBase.TrimEnd('/')}/{NormalizedPrefix()}index.json";
@@ -93,21 +100,18 @@ public static class CloudRouteService
             if (resp.IsSuccessStatusCode)
             {
                 var text = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                var parsed = JsonSerializer.Deserialize<List<CloudRouteInfo>>(text, JsonOpts);
-                if (parsed != null)
-                    list = parsed;
+                return JsonSerializer.Deserialize<List<CloudRouteInfo>>(text, JsonOpts);
                 // 云端清单每秒后台拉取，成功不记日志（防 jump.log 刷屏）
             }
-            else if ((int)resp.StatusCode != 404)
-            {
-                PluginLog.Error($"CloudRouteService: 云端清单拉取失败 HTTP {(int)resp.StatusCode}");
-            }
+            if ((int)resp.StatusCode == 404)
+                return new List<CloudRouteInfo>(); // 空桶（尚无路线）
+            PluginLog.Error($"CloudRouteService: 云端清单拉取失败 HTTP {(int)resp.StatusCode}");
         }
         catch (Exception ex)
         {
             Service.Log.Error(ex, "CloudRouteService: 云端清单拉取异常");
         }
-        return list;
+        return null; // 失败
     }
 
     /// <summary>下载并解析云端路线：GET 路线 JSON → RouteFile（与本地路线 JSON 同格式）。</summary>

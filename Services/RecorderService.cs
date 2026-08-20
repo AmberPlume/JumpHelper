@@ -85,7 +85,9 @@ public sealed class RecorderService : IDisposable
     private int _insertIndex = -1;
 
     // 起跳/落地（全部由游戏跳跃状态标志 ConditionFlag.Jumping 判定；Y 阈值判据已弃——爬坡误判）
-    private const long PendingTimeoutMs = 3000; // 起跳点 3s 未落地（标志未清除）= 异常，丢弃
+    private const long PendingTimeoutMs = 15000; // 起跳点 15s 未落地（标志未清除）= 异常，丢弃。
+    // 注：原来 3s——跳跳乐「从高空跳到低平台」机制滞空可达 5~10s，3s 会把好不容易命中的段丢弃
+    // （用户实测踩坑）。15s 覆盖高空坠落且保留"标志卡死自愈"安全网（真异常 15s 后自动清除）。
     private const float LandSettleDeltaY = 0.02f; // 标志清除后等待站稳：单帧下降小于此值 = 站稳
     private const long FlagLandSettleMs = 150;  // 标志清除后等待站稳的超时兜底（正常回稳更快）
     private const int HistoryMs = 2000;          // 位置/输入历史窗口（时间线起点查询用，2000ms 覆盖起跳前 600ms 富余）

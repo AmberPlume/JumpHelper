@@ -49,6 +49,7 @@ public sealed class FloatingPanel : Window
     private List<CloudRouteInfo> _cloudInfos = new(); // 云端清单缓存（异步后台拉取，UI 不阻塞）
     private List<CloudRouteInfo>? _lastCloudInfos;    // 上次引用的清单（检测更新重建地图选项）
     private volatile bool _cloudLoading;              // 后台拉取中标志（防并发重复请求）
+    private volatile bool _cloudLoadError;            // 云端清单最近一次拉取失败（UI 显示重试提示）
     private long _cloudLastRefresh;                   // 云端清单上次触发刷新时刻
     private bool _cloudFeedbackOpen;        // 路线反馈弹窗
     private string _cloudFeedbackName = ""; // 被反馈的路线名
@@ -992,8 +993,13 @@ public sealed class FloatingPanel : Window
             _cloudLoading = true;
             Task.Run(() =>
             {
-                try { _cloudInfos = CloudRouteService.ListRouteInfos(); }
-                catch { /* 拉取失败保留旧缓存，下次再试 */ }
+                try
+                {
+                    var r = CloudRouteService.ListRouteInfos();
+                    if (r != null) { _cloudInfos = r; _cloudLoadError = false; }
+                    else _cloudLoadError = true; // 失败：保留旧缓存，显示重试提示
+                }
+                catch { _cloudLoadError = true; }
                 _cloudLoading = false;
             });
         }
@@ -1038,8 +1044,20 @@ public sealed class FloatingPanel : Window
         var info = _cloudInfos;
         if (info.Count == 0)
         {
-            ImGui.TextColored(new Vector4(0.9f, 0.45f, 0.1f, 1f), "云端暂没有路线");
-            ImGui.TextDisabled("（上传自己的第一条路线吧）");
+            if (_cloudLoadError)
+            {
+                ImGui.TextColored(new Vector4(1f, 0.4f, 0.3f, 1f), "云端清单加载失败（网络/代理问题）");
+                ImGui.TextDisabled("点右上角「刷新」重试");
+            }
+            else if (_cloudLoading)
+            {
+                ImGui.TextDisabled("云端清单加载中…");
+            }
+            else
+            {
+                ImGui.TextColored(new Vector4(0.9f, 0.45f, 0.1f, 1f), "云端暂没有路线");
+                ImGui.TextDisabled("（上传自己的第一条路线吧）");
+            }
             return;
         }
 
