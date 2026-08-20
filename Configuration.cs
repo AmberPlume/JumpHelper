@@ -127,6 +127,13 @@ public class Configuration : IPluginConfiguration
     /// </summary>
     public bool AutoCastMoveBuffs { get; set; }
 
+    /// <summary>上次云端上传使用的上传人昵称（上传弹窗预填，免每次重输）。</summary>
+    public string CloudUploaderNickname { get; set; } = "";
+
+    /// <summary>已上传路线的删除令牌（路线名→del_token，仅本机保存——删除自己上传的云端路线用，
+    /// 由云函数用主密钥 HMAC(路线名) 生成并随上传下发，玩家无法伪造；不存云端防公开泄露）。</summary>
+    public Dictionary<string, string> CloudDelTokens { get; set; } = new();
+
     // ===== 段落记录方式（碎片/线性，二者参数互相独立） =====
 
     /// <summary>

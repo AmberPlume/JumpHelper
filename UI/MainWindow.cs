@@ -15,6 +15,8 @@ namespace JumpHelper.UI;
 public sealed class MainWindow : Window
 {
     private readonly RouteStore _routeStore;
+    private bool _suggestOpen;    // 提出建议弹窗
+    private string _suggestText = ""; // 建议内容
 
     /// <summary>悬浮窗显示开关回调（JumpHelper 挂接：勾选/取消勾选即开/关悬浮窗——悬浮窗关闭后不 Draw，
     /// 无法自同步配置，需由主窗口直接控制其 IsOpen）。</summary>
@@ -28,6 +30,9 @@ public sealed class MainWindow : Window
 
     public override void Draw()
     {
+        // 每次打开设置窗口都弹到屏幕中间（避免弹出在角落被漏看）
+        ImGui.SetNextWindowPos(ImGui.GetMainViewport().GetCenter(), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+
         if (ImGui.BeginTabBar("##ja_main"))
         {
             if (ImGui.BeginTabItem("基础设置"))
@@ -43,6 +48,40 @@ public sealed class MainWindow : Window
             }
 
             ImGui.EndTabBar();
+        }
+
+        // 提出建议弹窗（基础设置「提出建议」打开，文字不限）
+        if (_suggestOpen)
+        {
+            ImGui.SetNextWindowPos(ImGui.GetMainViewport().GetCenter(), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+            ImGui.SetNextWindowSize(new Vector2(420, 0), ImGuiCond.FirstUseEver);
+            if (ImGui.Begin("提出建议", ref _suggestOpen))
+            {
+                ImGui.Text("建议/反馈内容（文字不限）");
+                ImGui.SetNextItemWidth(380f);
+                ImGui.InputTextMultiline("##suggest_text", ref _suggestText, 2000, new Vector2(380, 120));
+                ImGui.Spacing();
+                var w2 = ImGui.GetContentRegionAvail().X;
+                var halfW2 = (w2 - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+                var canGo = _suggestText.Trim().Length > 0;
+                if (!canGo) ImGui.BeginDisabled();
+                if (ImGui.Button("提交", new Vector2(halfW2, 0)))
+                {
+                    if (CloudRouteService.SendSuggestion(_suggestText.Trim()))
+                    {
+                        Service.ChatGui.Print("建议已提交，感谢！");
+                        _suggestText = "";
+                        _suggestOpen = false;
+                    }
+                    else
+                        Service.ChatGui.PrintError("提交失败（查看日志）");
+                }
+                if (!canGo) ImGui.EndDisabled();
+                ImGui.SameLine();
+                if (ImGui.Button("取消", new Vector2(halfW2, 0)))
+                    _suggestOpen = false;
+                ImGui.End();
+            }
         }
     }
 
@@ -159,6 +198,15 @@ public sealed class MainWindow : Window
         }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("回放段需要冲刺而当前没有时自动施放冲刺（默认关闭=仅提醒）。速行永不自动施放——副本内禁用且慢跑无限，只做检测提醒（玩家手动施放，或施放冲刺等其结束变慢跑）");
+
+        // 提出建议（基础设置最下面）：向维护者提建议/反馈问题，文字不限
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+        if (ImGui.Button("提出建议", new Vector2(ImGui.GetContentRegionAvail().X, 36)))
+            _suggestOpen = true;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("向维护者提出建议/反馈问题（文字不限）");
     }
 
     // ===== 参数设置页：全部判定/物理参数 =====

@@ -35,10 +35,25 @@ public sealed class FloatingPanel : Window
     private RouteFile? _lastRouteRef;      // 路线切换检测（加载/新建/切换后重置起点/终点为默认就近/最远）
     private float _calibDist = 0.4f;       // 标定跳助跑距离（悬浮窗 << < > >> 步进 + 直接输入，米）
 
-    // 路线列表 / 新建 / 段落编辑 窗口状态
+    // 路线列表 / 新建 / 段落编辑 / 云端上传 窗口状态
     private bool _routeListOpen;
     private bool _newRouteOpen;
     private bool _segEditOpen;
+    private bool _cloudUploadOpen;
+    private string _cloudUploadName = "";   // 待上传的路线名（本地列表「上传」按钮置入）
+    private string _cloudNickname = "";     // 上传人昵称
+    private string _cloudDescription = "";  // 路线描述
+    private string _cloudSearch = "";       // 云端列表搜索词（路线名/上传人）
+    private string _cloudMapFilter = "";    // 云端列表地图筛选（空=全部地图）
+    private readonly List<string> _cloudMapOptions = new(); // 地图筛选项（云端清单填充）
+    private List<CloudRouteInfo> _cloudInfos = new(); // 云端清单缓存（异步后台拉取，UI 不阻塞）
+    private List<CloudRouteInfo>? _lastCloudInfos;    // 上次引用的清单（检测更新重建地图选项）
+    private volatile bool _cloudLoading;              // 后台拉取中标志（防并发重复请求）
+    private long _cloudLastRefresh;                   // 云端清单上次触发刷新时刻
+    private bool _cloudFeedbackOpen;        // 路线反馈弹窗
+    private string _cloudFeedbackName = ""; // 被反馈的路线名
+    private string _cloudFeedbackText = ""; // 反馈内容
+    private int _cloudPage;                 // 云端列表当前页（每页 5 条）
     private string _newRouteName = "";
     private string[] _routeNames = Array.Empty<string>();
     private string[] _routeMapLabels = Array.Empty<string>(); // 与 _routeNames 对应的地图名缓存（分列表格第二列，每秒刷新一次）
@@ -135,21 +150,26 @@ public sealed class FloatingPanel : Window
         // 行0：段落记录方式切换（线性 / 碎片）——仅「当前」按钮着淡色高亮（淡蓝=线性、淡橙=碎片）用以区分，
         // 未选中态与普通按钮一致（含悬停变亮）。两个按钮并排占满整行、高度与其他行统一。
         // 切换模式后强制「重新选择或新建路线」：卸载当前路线（自动保存），防止旧模式录的路线被新模式接着录。
+        // ⚠️ Push/Pop 必须用「点击前」的模式快照——按钮回调 SwitchMode 会改 Config.SegmentMode，
+        // 若点击后重新判断（如碎片→线性：点击前不 Push、点击后 if 为真却 Pop）→ 样式栈下溢 → cimgui 崩溃
+        // （用户实测：先点碎片再切回线性必崩，AccessViolation in cimgui.dll，根因即此）。
+        var modeIsLinear = Service.Config.SegmentMode == SegmentMode.Linear;
+        var modeIsFragment = Service.Config.SegmentMode == SegmentMode.Fragment;
         var modeW = (w - spacing) * 0.5f;
-        if (Service.Config.SegmentMode == SegmentMode.Linear)
+        if (modeIsLinear)
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.62f, 0.72f, 0.87f, 1f)); // 淡蓝
         if (ImGui.Button("线性", new Vector2(modeW, 0)))
             SwitchMode(SegmentMode.Linear, "线性：按段序号顺序依次跳跃，落点不自动衔接");
-        if (Service.Config.SegmentMode == SegmentMode.Linear)
+        if (modeIsLinear)
             ImGui.PopStyleColor();
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("线性：按段序号依次跳跃——连续不分段的常规地图（切换需重选/新建路线）");
         ImGui.SameLine();
-        if (Service.Config.SegmentMode == SegmentMode.Fragment)
+        if (modeIsFragment)
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.96f, 0.76f, 0.48f, 1f)); // 淡橙
         if (ImGui.Button("碎片", new Vector2(modeW, 0)))
             SwitchMode(SegmentMode.Fragment, "碎片：数字仅作段名，落地后按距离/高度自动衔接，岔路需手动选择");
-        if (Service.Config.SegmentMode == SegmentMode.Fragment)
+        if (modeIsFragment)
             ImGui.PopStyleColor();
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("碎片：先去左边跳一小段、再去右边跳一小段的分散地图——按落点→起跳点距离/高度自动衔接，岔路暂停选择（切换需重选/新建路线）");
@@ -336,7 +356,7 @@ public sealed class FloatingPanel : Window
         // 碎片岔路选择弹窗（普通非模态）：列出候选段起跳点（段号+坐标），玩家点选即继续
         if (pausedForBranch && _replay.BranchCandidates.Count > 0)
         {
-            ImGui.SetNextWindowSize(new Vector2(340, 0), ImGuiCond.Always);
+            CenterNextPopup(new Vector2(340, 0), ImGuiCond.Always);
             if (ImGui.Begin("碎片岔路——选择下段", ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.AlwaysAutoResize))
             {
                 ImGui.TextColored(new Vector4(0.9f, 0.45f, 0.1f, 1f),
@@ -361,7 +381,7 @@ public sealed class FloatingPanel : Window
         // 段落编辑窗口（普通非模态）：段列表 + 重录/截断/删除
         if (_segEditOpen)
         {
-            ImGui.SetNextWindowSize(new Vector2(380, 0), ImGuiCond.FirstUseEver);
+            CenterNextPopup(new Vector2(380, 0), ImGuiCond.FirstUseEver);
             if (ImGui.Begin("段落编辑", ref _segEditOpen))
             {
                 DrawSegmentEditor();
@@ -369,13 +389,30 @@ public sealed class FloatingPanel : Window
             }
         }
 
-        // 路线列表窗口（普通非模态窗口——不拦截其他输入，可与游戏/悬浮窗/主窗口同时交互）
+        // 路线列表窗口（普通非模态窗口——不拦截其他输入，可与游戏/悬浮窗/主窗口同时交互）。
+        // 分「本地 / 云端」两个分区：本地=现有路线管理；云端=玩家分享路线。
         if (_routeListOpen)
         {
-            ImGui.SetNextWindowSize(new Vector2(380, 0), ImGuiCond.FirstUseEver);
+            CenterNextPopup(new Vector2(1380, 0), ImGuiCond.FirstUseEver);
             if (ImGui.Begin("路线列表", ref _routeListOpen))
             {
-                DrawRouteList();
+                // Tab 按钮加大（FramePadding 撑大，方便点击辨识）；整段 push/pop 保证配对
+                ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(16f, 7f));
+                if (ImGui.BeginTabBar("##route_tabs"))
+                {
+                    if (ImGui.BeginTabItem("本地"))
+                    {
+                        DrawRouteList();
+                        ImGui.EndTabItem();
+                    }
+                    if (ImGui.BeginTabItem("云端"))
+                    {
+                        DrawCloudRouteList();
+                        ImGui.EndTabItem();
+                    }
+                    ImGui.EndTabBar();
+                }
+                ImGui.PopStyleVar();
                 ImGui.End();
             }
         }
@@ -383,10 +420,53 @@ public sealed class FloatingPanel : Window
         // 新建路线小窗口（路线列表点「新建」打开）
         if (_newRouteOpen)
         {
-            ImGui.SetNextWindowSize(new Vector2(320, 0), ImGuiCond.FirstUseEver);
+            CenterNextPopup(new Vector2(320, 0), ImGuiCond.FirstUseEver);
             if (ImGui.Begin("新建路线", ref _newRouteOpen))
             {
                 DrawNewRoute();
+                ImGui.End();
+            }
+        }
+
+        // 云端上传小窗口（本地路线「上传」按钮打开：填昵称 + 描述后确认上传）
+        if (_cloudUploadOpen)
+        {
+            CenterNextPopup(new Vector2(360, 0), ImGuiCond.FirstUseEver);
+            if (ImGui.Begin($"上传路线「{_cloudUploadName}」", ref _cloudUploadOpen))
+            {
+                DrawCloudUpload();
+                ImGui.End();
+            }
+        }
+
+        // 云端路线反馈弹窗（云端列表「反馈」打开：填内容提交 → 记入 report.json，维护者查阅）
+        if (_cloudFeedbackOpen)
+        {
+            CenterNextPopup(new Vector2(360, 0), ImGuiCond.FirstUseEver);
+            if (ImGui.Begin($"反馈「{_cloudFeedbackName}」", ref _cloudFeedbackOpen))
+            {
+                ImGui.Text("对该路线的反馈/问题");
+                ImGui.SetNextItemWidth(300f);
+                ImGui.InputTextMultiline("##fb_text", ref _cloudFeedbackText, 500, new Vector2(300, 80));
+                ImGui.Spacing();
+                var w2 = ImGui.GetContentRegionAvail().X;
+                var halfW2 = (w2 - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+                var canGo = _cloudFeedbackText.Trim().Length > 0;
+                if (!canGo) ImGui.BeginDisabled();
+                if (ImGui.Button("提交", new Vector2(halfW2, 0)))
+                {
+                    if (CloudRouteService.SendRouteFeedback(_cloudFeedbackName, _cloudFeedbackText.Trim()))
+                    {
+                        Service.ChatGui.Print($"已反馈「{_cloudFeedbackName}」");
+                        _cloudFeedbackOpen = false;
+                    }
+                    else
+                        Service.ChatGui.PrintError("提交失败（查看日志）");
+                }
+                if (!canGo) ImGui.EndDisabled();
+                ImGui.SameLine();
+                if (ImGui.Button("取消", new Vector2(halfW2, 0)))
+                    _cloudFeedbackOpen = false;
                 ImGui.End();
             }
         }
@@ -606,6 +686,13 @@ public sealed class FloatingPanel : Window
         ImGui.TextDisabled("重录=替换该段；截断=清掉该段及之后；删除=只删该段；扩展=段间行走完整复现（重录生效）。");
     }
 
+    /// <summary>弹窗居中：设置下次窗口尺寸，并在屏幕中心弹出（Appearing=每次打开都居中，防止弹在角落被漏看）。</summary>
+    private static void CenterNextPopup(Vector2 size, ImGuiCond sizeCond)
+    {
+        ImGui.SetNextWindowSize(size, sizeCond);
+        ImGui.SetNextWindowPos(ImGui.GetMainViewport().GetCenter(), ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+    }
+
     /// <summary>按像素宽度截断文本（超出加 …，供信息行路线名显示）。</summary>
     private static string TruncateText(string s, float maxW)
     {
@@ -657,9 +744,9 @@ public sealed class FloatingPanel : Window
 
         var w = ImGui.GetContentRegionAvail().X;
         var spacing = ImGui.GetStyle().ItemSpacing.X;
-        var btnW = (w - spacing * 4) * 0.2f;
+        var btnW = (w - spacing * 3) * 0.25f;
 
-        // 操作行：新建 / 加载 / 删除（未按 Ctrl 灰暗不可点）/ 导出 / 目录
+        // 操作行：新建 / 加载 / 删除（未按 Ctrl 灰暗不可点）/ 导出（「目录」已移至基础设置）
         if (ImGui.Button("新建", new Vector2(btnW, 0)))
             _newRouteOpen = true;
         if (ImGui.IsItemHovered())
@@ -693,11 +780,6 @@ public sealed class FloatingPanel : Window
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("导出选中路线为 JSON 文件");
         if (_routeNames.Length == 0) ImGui.EndDisabled();
-        ImGui.SameLine();
-        if (ImGui.Button("目录", new Vector2(btnW, 0)))
-            ChangeRouteDirectory();
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("修改路线文件目录（选择文件夹）");
 
         ImGui.Separator();
         ImGui.TextDisabled("双击路线名直接加载");
@@ -708,16 +790,17 @@ public sealed class FloatingPanel : Window
             return;
         }
 
-        // 路线列表（分列表格）：路线名称 | 地图 | 模式 | 速度状态。缓存数组每秒刷新时一次性计算——
+        // 路线列表（分列表格）：名称 | 地图 | 模式 | 速度 | 上传。缓存数组每秒刷新时一次性计算——
         // 避免每帧 Load JSON（DescribeRoute 内部读文件+解析，路线多时掉帧）。
-        if (ImGui.BeginTable("##routelist", 4, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY, new Vector2(w, 0)))
+        if (ImGui.BeginTable("##routelist", 5, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY, new Vector2(w, 0)))
         {
             ImGui.TableSetupColumn("名称", ImGuiTableColumnFlags.WidthStretch);
             ImGui.TableSetupColumn("地图", ImGuiTableColumnFlags.WidthStretch);
             ImGui.TableSetupColumn("模式", ImGuiTableColumnFlags.WidthStretch);
             ImGui.TableSetupColumn("速度", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("上传", ImGuiTableColumnFlags.WidthFixed);
             ImGui.TableNextRow(ImGuiTableRowFlags.Headers);
-            foreach (var h in new[] { "名称", "地图", "模式", "速度" })
+            foreach (var h in new[] { "名称", "地图", "模式", "速度", "上传" })
             {
                 ImGui.TableNextColumn();
                 CenterText(h);
@@ -733,11 +816,11 @@ public sealed class FloatingPanel : Window
 
                 ImGui.TableNextRow();
                 ImGui.TableSetColumnIndex(0);
-                // SpanAllColumns：整行可点击选中（点击地图/模式/状态列同样选中），双击直接加载。
-                // Selectable 不支持文本居中——用空 label 提供整行命中区，之后覆盖绘制居中文本。
+                // 不用 SpanAllColumns：Selectable 先画会抢占整行 hover/点击（ImGui 先画者优先），
+                // 导致第 4 列「上传」按钮永远点不到——Selectable 只占名称列，上传按钮独立可点。
                 var rowCellPos = ImGui.GetCursorPos();
                 var col0W = ImGui.GetColumnWidth();
-                if (ImGui.Selectable($"##row{i}", i == _selectedRoute, ImGuiSelectableFlags.SpanAllColumns))
+                if (ImGui.Selectable($"##row{i}", i == _selectedRoute))
                     _selectedRoute = i;
                 if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
                     loadRequested = true;
@@ -751,6 +834,17 @@ public sealed class FloatingPanel : Window
                 CenterText(modeLabel);
                 ImGui.TableSetColumnIndex(3);
                 CenterText(statusLabel);
+                ImGui.TableSetColumnIndex(4);
+                CenterWidget(ImGui.GetFrameHeight() * 2.6f);
+                if (ImGui.Button($"上传##up{i}"))
+                {
+                    _cloudUploadName = name;
+                    _cloudNickname = Service.Config.CloudUploaderNickname; // 记忆上次昵称
+                    _cloudDescription = "";
+                    _cloudUploadOpen = true;
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("上传该路线到云端分享（需先在基础设置配置云端桶与上传凭证）");
 
                 if (loadRequested)
                 {
@@ -883,6 +977,262 @@ public sealed class FloatingPanel : Window
         ImGui.TextDisabled("支持导入：别人分享的路线 JSON 文本 / 本地路线文件。");
     }
 
+    /// <summary>云端路线 tab：搜索 + 地图筛选 + 云端列表（名称/地图/模式/上传人/描述/下载）。
+    /// 上传/下载配置已硬编码（CloudRouteService），玩家零配置直接使用。
+    /// ⚠️ 云端清单必须缓存（每秒刷新）——每帧 ListRouteInfos() 是同步 HTTP，UI 线程阻塞 → 帧数爆降（实测 17）。</summary>
+    private void DrawCloudRouteList()
+    {
+        ImGui.Spacing();
+
+        // 云端清单缓存：每秒触发一次【后台线程】拉取（Task.Run），UI 线程不阻塞——
+        // 同步 HTTP 即使每秒一次也会卡帧（实测帧数掉），异步后帧率完全不受影响。
+        if (Environment.TickCount64 - _cloudLastRefresh > 1000 && !_cloudLoading)
+        {
+            _cloudLastRefresh = Environment.TickCount64;
+            _cloudLoading = true;
+            Task.Run(() =>
+            {
+                try { _cloudInfos = CloudRouteService.ListRouteInfos(); }
+                catch { /* 拉取失败保留旧缓存，下次再试 */ }
+                _cloudLoading = false;
+            });
+        }
+        // 清单更新后（引用变化）在主线程重建地图筛选项（List 不能跨线程并发写）
+        if (!ReferenceEquals(_lastCloudInfos, _cloudInfos))
+        {
+            _lastCloudInfos = _cloudInfos;
+            _cloudMapOptions.Clear();
+            foreach (var c in _cloudInfos)
+                if (!string.IsNullOrWhiteSpace(c.MapName) && !_cloudMapOptions.Contains(c.MapName))
+                    _cloudMapOptions.Add(c.MapName);
+        }
+
+        // 搜索 + 地图筛选 + 刷新按钮
+        var w = ImGui.GetContentRegionAvail().X;
+        var searchW = (w - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+        ImGui.SetNextItemWidth(searchW);
+        ImGui.InputTextWithHint("##cloud_search", "搜索路线名/上传人…", ref _cloudSearch, 64);
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(searchW - ImGui.GetFrameHeight() * 2.4f - ImGui.GetStyle().ItemSpacing.X);
+        var mapFilter = _cloudMapFilter.Length == 0 ? "全部地图" : _cloudMapFilter;
+        if (ImGui.BeginCombo("##cloud_map", mapFilter))
+        {
+            if (ImGui.Selectable("全部地图", _cloudMapFilter.Length == 0))
+                _cloudMapFilter = "";
+            foreach (var m in _cloudMapOptions)
+            {
+                if (ImGui.Selectable(m, _cloudMapFilter == m))
+                    _cloudMapFilter = m;
+            }
+            ImGui.EndCombo();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("按地图筛选（从云端清单的地图列提取）");
+        ImGui.SameLine();
+        if (ImGui.Button("刷新", new Vector2(ImGui.GetFrameHeight() * 2.4f, 0)))
+            _cloudLastRefresh = 0; // 立即重新拉取
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("立即刷新云端路线列表");
+
+        ImGui.Spacing();
+        var info = _cloudInfos;
+        if (info.Count == 0)
+        {
+            ImGui.TextColored(new Vector4(0.9f, 0.45f, 0.1f, 1f), "云端暂没有路线");
+            ImGui.TextDisabled("（上传自己的第一条路线吧）");
+            return;
+        }
+
+        // 过滤 + 分页（每页 5 条）
+        const int PageSize = 5;
+        var filtered = info
+            .Where(c => _cloudSearch.Length == 0
+                || c.Name.Contains(_cloudSearch, StringComparison.OrdinalIgnoreCase)
+                || c.Uploader.Contains(_cloudSearch, StringComparison.OrdinalIgnoreCase))
+            .Where(c => _cloudMapFilter.Length == 0 || c.MapName == _cloudMapFilter)
+            .ToList();
+        var totalPages = Math.Max(1, (filtered.Count + PageSize - 1) / PageSize);
+        if (_cloudPage >= totalPages) _cloudPage = totalPages - 1;
+        if (_cloudPage < 0) _cloudPage = 0;
+        var pageItems = filtered.Skip(_cloudPage * PageSize).Take(PageSize).ToList();
+
+        // 翻页栏（置于表格上方——时刻可见，无需滚动窗口）
+        var barW = ImGui.GetContentRegionAvail().X;
+        if (_cloudPage > 0)
+        {
+            if (ImGui.Button("上一页", new Vector2(80, 0)))
+                _cloudPage--;
+        }
+        else
+        {
+            ImGui.BeginDisabled();
+            ImGui.Button("上一页", new Vector2(80, 0));
+            ImGui.EndDisabled();
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled($"第 {_cloudPage + 1}/{totalPages} 页（共 {filtered.Count} 条）");
+        ImGui.SameLine(barW - 80f);
+        if (_cloudPage < totalPages - 1)
+        {
+            if (ImGui.Button("下一页", new Vector2(80, 0)))
+                _cloudPage++;
+        }
+        else
+        {
+            ImGui.BeginDisabled();
+            ImGui.Button("下一页", new Vector2(80, 0));
+            ImGui.EndDisabled();
+        }
+        ImGui.Spacing();
+
+        // 云端列表：名称 | 地图 | 模式 | 上传人 | 描述 | 操作（下载/反馈横排）——固定高度防把翻页栏挤出视口
+        if (ImGui.BeginTable("##cloudlist", 6, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY, new Vector2(w, 300)))
+        {
+            ImGui.TableSetupColumn("名称", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("地图", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("模式", ImGuiTableColumnFlags.WidthFixed);
+            ImGui.TableSetupColumn("上传人", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("描述", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("操作", ImGuiTableColumnFlags.WidthFixed, 120f);
+            ImGui.TableNextRow(ImGuiTableRowFlags.Headers);
+            foreach (var h in new[] { "名称", "地图", "模式", "上传人", "描述", "操作" })
+            {
+                ImGui.TableNextColumn();
+                CenterText(h);
+            }
+
+            foreach (var c in pageItems)
+            {
+                ImGui.TableNextRow();
+                ImGui.TableSetColumnIndex(0);
+                CenterText(c.Name);
+                ImGui.TableSetColumnIndex(1);
+                CenterText(c.MapName);
+                ImGui.TableSetColumnIndex(2);
+                CenterText(c.ModeLabel);
+                ImGui.TableSetColumnIndex(3);
+                CenterText(c.Uploader);
+                ImGui.TableSetColumnIndex(4);
+                // 描述：截断显示，悬停显示完整内容（不换行也能看全）
+                var descText = c.Description.Length > 12 ? c.Description[..12] + "…" : c.Description;
+                CenterText(descText);
+                if (c.Description.Length > 12 && ImGui.IsItemHovered())
+                    ImGui.SetTooltip(c.Description);
+                ImGui.TableSetColumnIndex(5);
+                // 操作列：下载 + 反馈 横排
+                var opW = (ImGui.GetColumnWidth() - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+                if (ImGui.Button($"下载##cd{c.Name}", new Vector2(opW, 0)))
+                {
+                    var route = CloudRouteService.DownloadRoute(c.Name);
+                    if (route != null && _routeStore.Save(route))
+                    {
+                        _lastRouteRefresh = 0; // 刷新本地列表（新下载的路线立即可见）
+                        Service.ChatGui.Print($"云端路线「{c.Name}」已下载到本地");
+                    }
+                    else
+                        Service.ChatGui.PrintError("下载失败（查看日志）");
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("下载该路线到本地");
+                ImGui.SameLine();
+                if (ImGui.Button($"反馈##fb{c.Name}", new Vector2(opW, 0)))
+                {
+                    _cloudFeedbackName = c.Name;
+                    _cloudFeedbackText = "";
+                    _cloudFeedbackOpen = true;
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip("反馈该路线的问题/建议");
+                // 删除（仅本机上传过的路线有 del_token 才显示——上传者只能删自己的）
+                if (Service.Config.CloudDelTokens.TryGetValue(c.Name, out var delTok) && !string.IsNullOrEmpty(delTok))
+                {
+                    ImGui.SameLine();
+                    if (ImGui.Button($"删除##del{c.Name}", new Vector2(opW, 0)))
+                    {
+                        if (CloudRouteService.DeleteRoute(c.Name, delTok))
+                        {
+                            Service.ChatGui.Print($"已删除云端路线「{c.Name}」");
+                            Service.Config.CloudDelTokens.Remove(c.Name);
+                            Service.Config.Save();
+                            _cloudLastRefresh = 0; // 刷新列表
+                        }
+                        else
+                            Service.ChatGui.PrintError("删除失败（查看日志）");
+                    }
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("删除自己上传的云端路线");
+                }
+            }
+            ImGui.EndTable();
+        }
+    }
+
+    /// <summary>云端上传弹窗：填上传人昵称 + 路线描述 → 确认上传（函数校验后写云端）。</summary>
+    private void DrawCloudUpload()
+    {
+        ImGui.Text($"路线：{_cloudUploadName}");
+        ImGui.Spacing();
+
+        ImGui.Text("上传人昵称");
+        ImGui.SetNextItemWidth(300f);
+        ImGui.InputText("##cloud_nick", ref _cloudNickname, 32);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("显示在云端列表的「上传人」列（分享者署名）");
+
+        ImGui.Text("路线描述");
+        ImGui.SetNextItemWidth(300f);
+        ImGui.InputText("##cloud_desc", ref _cloudDescription, 120);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("给其他玩家看的路线说明（地图/路线要点等）");
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var w = ImGui.GetContentRegionAvail().X;
+        var halfW = (w - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+        var canGo = _cloudNickname.Trim().Length > 0; // 上传凭证已硬编码，只需昵称
+        if (!canGo) ImGui.BeginDisabled();
+        if (ImGui.Button("确认上传", new Vector2(halfW, 0)))
+        {
+            var route = _routeStore.Load(_cloudUploadName);
+            if (route == null)
+            {
+                Service.ChatGui.PrintError("路线加载失败，无法上传");
+            }
+            else
+            {
+                var (ok, delToken) = CloudRouteService.UploadRoute(route, _cloudNickname.Trim(), _cloudDescription.Trim());
+                if (ok)
+                {
+                    Service.Config.CloudUploaderNickname = _cloudNickname.Trim(); // 记忆昵称
+                    if (!string.IsNullOrEmpty(delToken))
+                    {
+                        Service.Config.CloudDelTokens[route.Name] = delToken; // 保存删除令牌（仅本机）
+                        Service.ChatGui.Print($"路线「{_cloudUploadName}」已上传到云端（可删除自己的此路线）");
+                    }
+                    else
+                    {
+                        Service.ChatGui.Print($"路线「{_cloudUploadName}」已上传到云端");
+                    }
+                    Service.Config.Save();
+                    _cloudLastRefresh = 0; // 上传成功立即刷新云端列表（缓存）
+                    _cloudUploadOpen = false;
+                }
+                else
+                {
+                    Service.ChatGui.PrintError("上传失败（查看日志）");
+                }
+            }
+        }
+        if (!canGo) ImGui.EndDisabled();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(canGo ? "上传到云端路线库" : "需填写上传人昵称");
+        ImGui.SameLine();
+        if (ImGui.Button("取消", new Vector2(halfW, 0)))
+            _cloudUploadOpen = false;
+    }
+
     /// <summary>导出选中路线：保存对话框选择位置，写入路线 JSON。</summary>
     private void ExportSelectedRoute()
     {
@@ -913,23 +1263,6 @@ public sealed class FloatingPanel : Window
     }
 
     /// <summary>修改路线目录：弹文件夹选择框，改目录并刷新路线列表（RouteStore 保存配置）。</summary>
-    private void ChangeRouteDirectory()
-    {
-        var dir = Dialogs.PickFolder("选择路线目录");
-        if (dir == null)
-            return; // 用户取消
-        if (_routeStore.ChangeDirectory(dir))
-        {
-            _selectedRoute = 0;
-            _lastRouteRefresh = 0;
-            Service.ChatGui.Print($"路线目录已修改: {dir}");
-        }
-        else
-        {
-            Service.ChatGui.PrintError("目录修改失败（查看日志）");
-        }
-    }
-
     // ===== 文件对话框（WinForms 需 STA 线程——统一实现见 Utils/Dialogs.cs） =====
 
     /// <summary>切换段落记录方式（线性 / 碎片）。切换后强制「重新选择或新建路线」：先停回放，

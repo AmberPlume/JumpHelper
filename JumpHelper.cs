@@ -32,7 +32,7 @@ public sealed class JumpHelper : IDalamudPlugin
 
         dalamud.Create<Service>();
         PluginLog.Init(dalamud.ConfigDirectory.FullName);
-        Service.Log.Error("JumpHelper 构造开始");
+        PluginLog.Info("JumpHelper 构造开始");
 
         try
         {
@@ -62,7 +62,7 @@ public sealed class JumpHelper : IDalamudPlugin
                 ShowInHelp = true
             });
 
-            Service.Log.Error("JumpHelper 加载成功");
+            PluginLog.Info("JumpHelper 加载成功");
         }
         catch (Exception ex)
         {
