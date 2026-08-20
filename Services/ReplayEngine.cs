@@ -39,7 +39,7 @@ public enum ReplayState
     WalkAdjust,
 
     /// <summary>等待玩家手动走到下一段起跳点（段间长距离——跳跳乐地图机制复杂，
-    /// 段间行走路径回放不可靠，交玩家手动走，到位后自动继续跳）。</summary>
+    /// 段间行走路径回放不可靠，交玩家手动走，到位后自动继续读档）。</summary>
     AwaitPlayer,
 
     /// <summary>移速状态修正（段前校验：录制段需冲刺/慢跑/速行而玩家当前没有时——
@@ -50,6 +50,10 @@ public enum ReplayState
     /// <summary>常速段冲突暂停（录制常速、玩家当前带移速状态）：无法自动取消状态，暂停等待玩家
     /// 自行处理（清除状态或确认带状态继续），点悬浮窗「继续」恢复或「终止」取消。</summary>
     PausedForStatus,
+
+    /// <summary>碎片模式岔路暂停：本段落点附近有多个"可衔接且距离/高度达标"的候选起跳点，等玩家在
+    /// 悬浮窗弹出框选择跳哪一段；选完恢复（PausedForBranch → 对应段读档）。</summary>
+    PausedForBranch,
 
     /// <summary>成功（到达终点标记）。</summary>
     Success,
@@ -131,6 +135,16 @@ public unsafe sealed class ReplayEngine : IDisposable
     private long _lastInputGateDiagMs;     // 输入等待诊断日志限频（LastInputAllowed=false 时打印门控分量）
     private long _preRunDiagMs;            // 预助跑采样诊断限频（定位"位置在动但速度采样 0"）
 
+    // 碎片模式（SegmentMode.Fragment）：段落有序号但仅作"名字"，不依赖序号——据此回放（GoNextSegmentFragment）按
+    // "本段落点→某段起跳点"的水平距离（≤ FragLinkDistXZ）与高度（|ΔY| ≤ FragLinkDistY）自动衔接下一步。
+    // 碎片岔路（多候选）：暂停等玩家选择，候选段索引列表（悬浮窗弹窗据此渲染；选择后清空）。
+    public IReadOnlyList<int> BranchCandidates { get; private set; } = Array.Empty<int>();
+
+    /// <summary>当前模式对应的 Y 对齐容差：碎片用 FragYAlignTolerance，线性用 YAlignTolerance。</summary>
+    private float ModeYAlignTolerance => Service.Config.SegmentMode == SegmentMode.Fragment
+        ? Service.Config.FragYAlignTolerance
+        : Service.Config.YAlignTolerance;
+
     // ===== 链跳测试（/ja chaintest：对比"单独跳"与"连跳第二跳"的跳距——验证落地速度是否给后一跳加成） =====
     private bool _chainMode;               // 链跳测试进行中
     private int _chainJumps;               // 已完成跳数（0=第1跳前，1=第1跳完成，2=全部完成）
@@ -184,10 +198,11 @@ public unsafe sealed class ReplayEngine : IDisposable
     /// 防"滑过起点后停稳 → overshoot 误触发未移动"（实测段 1 走两步不动）。</summary>
     private const float PreRunStartSpeedTol = 0.15f;
 
-    /// <summary>移速状态修正超时（毫秒）：速行/冲刺施放后生效快（≤6s）；冲刺等变慢跑
-    /// （20s 冲刺效果 + 缓冲）放宽到 26s；通用兜底 30s。</summary>
+    /// <summary>移速状态修正超时（毫秒）：速行/冲刺施放后生效快（≤6s）；慢跑/速行目标放宽到 35s——
+    /// 速行不再自动施放，玩家需手动施放速行（5s CD），或无速行职业时施放冲刺等其结束变慢跑
+    /// （20s 冲刺效果 + 判定缓冲），35s 覆盖两条路径；通用兜底 30s。</summary>
     private const long AwaitStatusTimeoutBaseMs = 6000;
-    private const long AwaitStatusSprintToJogMs = 26000;
+    private const long AwaitStatusSprintToJogMs = 35000;
     private const long AwaitStatusTimeoutMaxMs = 30000;
 
     /// <summary>走位摔落检测：走位中玩家 Y 与目标 Y 差超过此值 = 已不在目标平台（摔落/被障碍推下）——
@@ -209,11 +224,9 @@ public unsafe sealed class ReplayEngine : IDisposable
 
     // ===== 入口 =====
 
-    /// <summary>
-    /// 按段索引回放：从起点段执行到终点段（段内自含起点对齐——ExecuteSegment 的 NavToRunStart
+    /// <summary>按段索引回放：从起点段执行到终点段（段内自含起点对齐——ExecuteSegment 的 NavToRunStart
     /// 会走位到该段预助跑起点，玩家需自行到起点段起跳点所在平台，高度匹配检查保证）。
-    /// 段表格的"读档"用此接口（起点/终点 = 段，比标记更细粒度；不丢弃任何段）。
-    /// </summary>
+    /// 段表格的"执行"用此接口（起点/终点 = 段，比标记更细粒度；不丢弃任何段）。</summary>
     public void StartRouteSegments(RouteFile route, int startSegment, int endSegment)
     {
         if (route.Segments.Count == 0)
@@ -248,7 +261,7 @@ public unsafe sealed class ReplayEngine : IDisposable
         var player = Service.ObjectTable.LocalPlayer;
         if (player != null)
         {
-            var yAlign = Service.Config.YAlignTolerance; // 路不平地图放宽（默认 0.3m）
+            var yAlign = ModeYAlignTolerance; // 当前模式 Y 容差（线性 0.3 / 碎片 0.2）
             var yDiff = MathF.Abs(player.Position.Y - startPos.Y);
             if (yDiff > yAlign)
             {
@@ -375,7 +388,7 @@ public unsafe sealed class ReplayEngine : IDisposable
         State = ReplayState.Idle;
     }
 
-    /// <summary>常速冲突暂停（PausedForStatus）后继续：跳过本段状态检查直接执行——
+    /// <summary>常速冲突暂停（PausedForStatus）后继续：跳过本段状态检查直接读档——
     /// 玩家点「继续」即确认带状态继续（自担跳过头风险）。</summary>
     public void Resume()
     {
@@ -392,8 +405,8 @@ public unsafe sealed class ReplayEngine : IDisposable
 
     // ===== 段执行 =====
 
-    /// <summary>操作模式一致性检测（同 RecorderService）：录制模式 vs 当前模式不一致 → 警告。
-    /// 输入语义依赖操作模式（标准=相对角色朝向可复现；传统=相对相机不可复现），混合必偏。</summary>
+    /// <summary>操作模式一致性检测（同 RecorderService）：录制模式 vs 当前模式不一致 → 仅记录日志
+    /// （加载路线时已自动切到录制模式，此处兜底；玩家手动改回时回放方向可能偏差）。</summary>
     private void CheckControlMode(RouteFile route)
     {
         var cur = _movement.IsLegacyMode ? 1 : 0;
@@ -401,9 +414,7 @@ public unsafe sealed class ReplayEngine : IDisposable
             return;
         var modeName = cur == 1 ? "传统" : "标准";
         var recName = route.ControlMode == 1 ? "传统" : "标准";
-        Service.ChatGui.PrintError($"操作模式警告：当前是{modeName}模式，但该路线录制时是{recName}模式——输入语义不同，" +
-                                   $"回放方向会偏差。请切回{recName}模式（建议统一用标准模式录制/回放）");
-        PluginLog.Info($"ReplayEngine: 操作模式不一致 当前 {modeName} vs 录制 {recName}——回放方向可能偏差");
+        PluginLog.Info($"ReplayEngine: 操作模式不一致（兜底） 当前 {modeName} vs 录制 {recName}——回放方向可能偏差");
     }
 
     /// <summary>
@@ -413,6 +424,15 @@ public unsafe sealed class ReplayEngine : IDisposable
     /// </summary>
     private void GoNextSegment()
     {
+        // 碎片模式：段落有序号但仅作"名字"，不依赖序号；按"本段落点→某段起跳点"的水平距离（≤ FragLinkDistXZ）
+        // 与高度（|ΔY| ≤ FragLinkDistY）自动衔接下一步。单候选自动跳；多候选（岔路）暂停让玩家选；
+        // 无候选即本部分结束（自动终止，交玩家手动读档）。Y 高度绝不忽略。
+        if (Service.Config.SegmentMode == SegmentMode.Fragment)
+        {
+            GoNextSegmentFragment();
+            return;
+        }
+
         var next = CurrentSegment + 1;
         if (next > EndSegment)
         {
@@ -438,13 +458,91 @@ public unsafe sealed class ReplayEngine : IDisposable
             _awaitStableSince = 0;
             _awaitLastPos = Service.ObjectTable.LocalPlayer?.Position ?? takeoff;
             EnterState(ReplayState.AwaitPlayer);
-            Service.ChatGui.Print($"段 {CurrentSegment + 1} 完成——请手动走到段 {next + 1} 起跳点（{takeoff.X:F0},{takeoff.Y:F0},{takeoff.Z:F0}，需同高度），到位后自动继续跳");
+            Service.ChatGui.Print($"请走到段 {next + 1} 起跳点（{takeoff.X:F0},{takeoff.Y:F0},{takeoff.Z:F0}），到位后自动继续");
             PluginLog.Info($"ReplayEngine: 段 {CurrentSegment + 1} 完成，段间距离 {dist:F1}m（>{Service.Config.LongWalkDist:F1}m）——等待玩家手动走到段 {next + 1} 起跳点");
         }
         else
         {
             ExecuteSegment(next);
         }
+    }
+
+    /// <summary>碎片模式下一步：在本段落点附近（水平 ≤ FragLinkDistXZ 且 |ΔY| ≤ FragLinkDistY）找可衔接段。
+    /// 单候选自动跳；多候选 = 岔路，暂停让玩家在悬浮窗选；无候选即本部分结束（自动终止）。</summary>
+    private void GoNextSegmentFragment()
+    {
+        if (CurrentRoute == null)
+        {
+            Stop();
+            return;
+        }
+
+        var land = CurrentRoute.Segments[CurrentSegment].Land;
+        var xz = Service.Config.FragLinkDistXZ;
+        var dyMax = Service.Config.FragLinkDistY;
+        var xzSq = xz * xz;
+        // 碎片模式不依赖起点/终点选择，遍历全部段找可衔接候选
+        var candidates = new List<int>();
+        for (int i = 0; i < CurrentRoute.Segments.Count; i++)
+        {
+            if (i == CurrentSegment)
+                continue;
+            var takeoff = CurrentRoute.Segments[i].Takeoff;
+            var dx = takeoff.X - land.X;
+            var dz = takeoff.Z - land.Z;
+            var dSq = dx * dx + dz * dz;
+            var dy = Math.Abs(takeoff.Y - land.Y);
+            // 水平与垂直双重判定（Y 绝不忽略）：本段落点 → 下一起跳点 水平 ≤ xz 且 |ΔY| ≤ dyMax 才衔接。
+            if (dSq <= xzSq && dy <= dyMax)
+                candidates.Add(i);
+        }
+
+        if (candidates.Count == 0)
+        {
+            // 本碎片部分结束：无候选衔接段（其余段距/高差超过阈值 = 另一部分）。自动终止（碎片如小蛋糕，
+            // 没有"可衔接"的下阶段就终止），交玩家手动走到下一段附近后点悬浮窗「路线回放」读档跳回。
+            PluginLog.Info($"ReplayEngine: 碎片结束——段 {CurrentSegment + 1} 后无衔接段（其余段 水平>{xz:F1}m 或 高差>{dyMax:F1}m），自动终止");
+            ChatInfo($"附近无可衔接段落，已自动终止");
+            State = ReplayState.Success;
+            Stop();
+            return;
+        }
+
+        if (candidates.Count == 1)
+        {
+            var best = candidates[0];
+            PluginLog.Info($"ReplayEngine: 碎片自动衔接 段 {CurrentSegment + 1} → {best + 1}（落点→起跳点 {LandDistToSeg(best):F2}m）");
+            ExecuteSegment(best);
+            return;
+        }
+
+        // 多候选 = 岔路：暂停让玩家在悬浮窗弹窗选跳哪一段。记录候选项供 ChooseBranch 使用。
+        BranchCandidates = candidates;
+        PluginLog.Info($"ReplayEngine: 碎片岔路——段 {CurrentSegment + 1} 落点附近 {candidates.Count} 个候选起跳点 {string.Join(",", candidates.ConvertAll(c => (c + 1).ToString()))}，暂停等玩家选择");
+        ChatInfo($"岔路：附近 {candidates.Count} 个可衔接起跳点，请在悬浮窗选择");
+        EnterState(ReplayState.PausedForBranch);
+    }
+
+    /// <summary>碎片岔路暂停后玩家选择下一步：跳转并执行选定候选段。</summary>
+    public void ChooseBranch(int segmentIndex)
+    {
+        if (State != ReplayState.PausedForBranch || CurrentRoute == null)
+            return;
+        if (segmentIndex < 0 || segmentIndex >= CurrentRoute.Segments.Count)
+            return;
+        BranchCandidates = new List<int>();
+        PluginLog.Info($"ReplayEngine: 碎片岔路选择 玩家选中段 {segmentIndex + 1}");
+        ExecuteSegment(segmentIndex);
+    }
+
+    /// <summary>当前段落点 → 指定段起跳点的水平距离（碎片衔接诊断显示用）。</summary>
+    private float LandDistToSeg(int i)
+    {
+        var land = CurrentRoute!.Segments[CurrentSegment].Land;
+        var t = CurrentRoute.Segments[i].Takeoff;
+        var dx = t.X - land.X;
+        var dz = t.Z - land.Z;
+        return MathF.Sqrt(dx * dx + dz * dz);
     }
 
     /// <summary>是否扩展段（需完整复现段间行走）：仅玩家在段落编辑主动勾选「扩展」的段（Extended == true）。
@@ -516,7 +614,7 @@ public unsafe sealed class ReplayEngine : IDisposable
         _landPos = seg.Land;
 
         // 移速状态校验（段前）：录制段需冲刺/慢跑/速行而玩家当前没有 → 进入 AwaitStatus 自动补/等待。
-        // 返回 false = 已进入 AwaitStatus 或已按"仅提醒"放行（不再执行本段走位，等待状态就绪后重入）。
+        // 返回 false = 已进入 AwaitStatus 或已按"仅提醒"放行（不再读档本段走位，等待状态就绪后重入）。
         if (!EnsureMoveStatus(seg, index))
             return;
 
@@ -623,7 +721,7 @@ public unsafe sealed class ReplayEngine : IDisposable
 
     /// <summary>
     /// 段前移速状态校验（起跳速度必须与录制一致——用户实测：带状态跳常速段会跳过头，小平台必跌）。
-    /// 返回 true = 状态就绪/已按设置放行，可继续执行本段；false = 已进入 AwaitStatus 等待（或
+    /// 返回 true = 状态就绪/已按设置放行，可继续读档本段；false = 已进入 AwaitStatus 等待（或
     /// "仅提醒"模式已放行，无需等待）。
     /// 规则：
     ///   - 一致 → 直接放行；
@@ -681,27 +779,21 @@ public unsafe sealed class ReplayEngine : IDisposable
         var target = seg.MoveState;
         var current = MoveStatusHelper.DetectCurrentState();
         if (current == target)
-        {
-            // 速行自动续期：本段仍需慢跑/速行且速行将到期（剩余<3s）→ 自动续上。
-            // 仅自动释放开启时；慢跑是永久状态无需续（PelotonRemainingSeconds 无速行时返回 MaxValue）。
-            if (Service.Config.AutoCastMoveBuffs && target == MoveState.SlowBuff
-                && MoveStatusHelper.PelotonRemainingSeconds() < 3f && MoveStatusHelper.CastPeloton())
-                ChatInfo($"段 {segNo} 速行将到期，已自动续上");
-            return true;
-        }
+            return true; // 状态一致直接放行（速行不再自动续期——副本内禁用速行，且慢跑持续时间无限）
 
         // 录制常速、当前带状态：无法自动取消（慢跑 CanStatusOff=false，实测 ExecuteCommand RemoveStatus
         // 也取消不了）→ 暂停等玩家处理（实测：仅提醒玩家来不及反应，且状态不一致必跳过头——直接暂停最稳）
         if (target == MoveState.None)
         {
-            Service.ChatGui.PrintError($"段 {segNo} 录制为常速，当前带{MoveStatusHelper.StateName(current)}——已暂停，处理状态后点「继续」或「终止」");
+            Service.ChatGui.PrintError($"段 {segNo} 录制为常速，当前带{MoveStatusHelper.StateName(current)}——已暂停，清除状态后点「继续」");
             PluginLog.Info($"ReplayEngine: 段 {segNo} 常速段带状态 {MoveStatusHelper.StateName(current)}——暂停等待玩家处理");
             EnterState(ReplayState.PausedForStatus);
             return false;
         }
 
-        // 自动释放关闭：仅提醒不施放（未处理则回放因起跳速度不匹配失败）
-        if (!Service.Config.AutoCastMoveBuffs)
+        // 自动释放关闭：冲刺目标——仅提醒直接继续（玩家未手动处理则回放因速度不匹配失败）；
+        // 慢跑/速行目标——即使关闭也进入下方等待（AwaitStatus 内不施放、仅提醒玩家手动施放速行/冲刺等变慢跑）。
+        if (!Service.Config.AutoCastMoveBuffs && target != MoveState.SlowBuff)
         {
             Service.ChatGui.PrintError($"段 {segNo} 需要{MoveStatusHelper.StateName(target)}状态，当前{MoveStatusHelper.StateName(current)}——已关闭自动释放，请手动处理");
             PluginLog.Info($"ReplayEngine: 段 {segNo} 缺 {MoveStatusHelper.StateName(target)}（当前 {MoveStatusHelper.StateName(current)}）——自动释放已关闭，仅提醒");
@@ -736,7 +828,7 @@ public unsafe sealed class ReplayEngine : IDisposable
     private const long TakeoffPreAlignMs = 250;
 
     /// <summary>等待玩家到位判定（米）：段间长距离时玩家与下一段起跳点 XZ 距离小于此值且 Y 匹配
-    /// （|Y差| ≤ YAlignTolerance，默认 0.3m 路不平放宽）= 已到位 → 自动继续执行下一段（执行时 NavToRunStart 会精确对齐）。</summary>
+    /// （|Y差| ≤ 当前模式 Y 对齐容差，线性 0.3 / 碎片 0.2）= 已到位 → 自动继续读档下一段（读档时 NavToRunStart 会精确对齐）。</summary>
     private const float AwaitArriveDist = 1.5f;
 
     /// <summary>等待稳定确认的帧位移阈值（米）：玩家每帧 XZ 位移超过此值 = 仍在移动（走路 ~0.025m/帧），重置计时。</summary>
@@ -1347,7 +1439,7 @@ public unsafe sealed class ReplayEngine : IDisposable
                 else
                 {
                     // 落点偏离过远（掉出平台/大幅偏离）：回起跳点重跳大概率路径不可达（跳跳乐地形），
-                    // 只会造成无意义的异常移动——直接失败，由玩家读档/手动处理
+                    // 只会造成无意义的异常移动——直接失败，由玩家手动处理或重新读档
                     PluginLog.Error($"ReplayEngine: 落点偏离过远 {DistanceToTarget:F2}m（>{Service.Config.LandWalkDist:F1}m），回跳无意义，回放失败");
                     Fail();
                 }
@@ -1374,7 +1466,7 @@ public unsafe sealed class ReplayEngine : IDisposable
 
                 // 摔落/平台不符检测：走位对齐中玩家摔落（实测段21 落点偏 1.03m 走位对齐时从平台摔落，
                 // Y 65→37 掉 27.6m，插件仍注入 8 秒把玩家拉向落点 → 与玩家手动走回互相拉扯，且 XZ 到位后
-                // 从错误高度执行下一段）→ 检测到立即释放控制并失败
+                // 从错误高度读档下一段）→ 检测到立即释放控制并失败
                 if (CheckWalkFell(player.Position, _landPos, now))
                     break;
 
@@ -1388,12 +1480,12 @@ public unsafe sealed class ReplayEngine : IDisposable
             case ReplayState.AwaitPlayer:
             {
                 // 段间长距离：等待玩家手动走到下一段起跳点（跳跳乐地图机制复杂，段间行走交玩家），
-                // 到位（XZ 近 + 同平台）且基本静止稳定 AwaitStableMs → 自动继续执行下一段
+                // 到位（XZ 近 + 同平台）且基本静止稳定 AwaitStableMs → 自动继续读档下一段
                 var aDist = player.Position - _awaitTarget;
                 DistanceToTarget = aDist.Length();
                 var aXZ = aDist;
                 aXZ.Y = 0;
-                var near = aXZ.Length() < AwaitArriveDist && MathF.Abs(aDist.Y) <= Service.Config.YAlignTolerance;
+                var near = aXZ.Length() < AwaitArriveDist && MathF.Abs(aDist.Y) <= ModeYAlignTolerance;
                 if (near)
                 {
                     // 稳定确认：玩家在起跳点附近需基本静止持续 AwaitStableMs（防路过误触发抢控制）
@@ -1412,7 +1504,7 @@ public unsafe sealed class ReplayEngine : IDisposable
                         if (now - _awaitStableSince >= (long)Service.Config.AwaitStableMs)
                         {
                             _awaitStableSince = 0;
-                            PluginLog.Info($"ReplayEngine: 玩家已到位并稳定 {Service.Config.AwaitStableMs:F0}ms → 继续执行段 {CurrentSegment + 2}");
+                            PluginLog.Info($"ReplayEngine: 玩家已到位并稳定 {Service.Config.AwaitStableMs:F0}ms → 继续读档段 {CurrentSegment + 2}");
                             ExecuteSegment(CurrentSegment + 1);
                             break;
                         }
@@ -1444,19 +1536,20 @@ public unsafe sealed class ReplayEngine : IDisposable
                 {
                     PluginLog.Info(_awaitIsWalkSwitch
                         ? $"ReplayEngine: 走路切换就绪（{( _awaitNeedWalk ? "慢走" : "跑步")}）→ 继续段 {CurrentSegment + 1} 状态校验"
-                        : $"ReplayEngine: 状态就绪（{MoveStatusHelper.StateName(_awaitTargetState)}）→ 继续执行段 {CurrentSegment + 1}");
+                        : $"ReplayEngine: 状态就绪（{MoveStatusHelper.StateName(_awaitTargetState)}）→ 继续读档段 {CurrentSegment + 1}");
                     ExecuteSegment(CurrentSegment); // 重入：EnsureMoveStatus 此时一致直接放行，走正常流程
                     break;
                 }
 
-                // 施放技能（2s 节流重试：施放可能因 GCD/动作锁失败；速行 5s CD、冲刺 60s CD 重试间隔够用）。
+                // 施放技能（2s 节流重试：施放可能因 GCD/动作锁失败；冲刺 60s CD 重试间隔够用）。
                 // 走路切换阶段不施放（切回跑步由重入后的 buff 修正处理）。
+                // 自动释放只处理冲刺：速行（SlowBuff）目标永不自动施放（副本内禁用速行、慢跑无限），仅提醒。
                 if (!_awaitIsWalkSwitch && !_awaitCastDone && now - _awaitLastCastAt > 2000)
                 {
                     _awaitLastCastAt = now;
                     if (_awaitTargetState == MoveState.Sprint)
                     {
-                        if (MoveStatusHelper.CastSprint())
+                        if (Service.Config.AutoCastMoveBuffs && MoveStatusHelper.CastSprint())
                         {
                             _awaitCastDone = true;
                             ChatInfo($"段 {CurrentSegment + 1} 需要冲刺状态，已自动施放技能");
@@ -1467,19 +1560,12 @@ public unsafe sealed class ReplayEngine : IDisposable
                             Service.ChatGui.PrintError($"段 {CurrentSegment + 1} 冲刺不可用（CD/未解锁），自动重试中");
                         }
                     }
-                    else // SlowBuff 目标：优先速行（同速即生效），无速行职业 → 冲刺（等 20s 变慢跑）
+                    else // SlowBuff 目标：不自动施放速行，仅提醒玩家手动处理（施放速行，或施放冲刺等其结束变慢跑）
                     {
-                        if (MoveStatusHelper.CastForSlowBuff(out var usedSprint))
-                        {
-                            _awaitCastDone = true;
-                            ChatInfo(usedSprint
-                                ? $"段 {CurrentSegment + 1} 需要慢跑/速行状态，已自动施放冲刺，等变慢跑后自动继续"
-                                : $"段 {CurrentSegment + 1} 需要慢跑/速行状态，已自动施放技能");
-                        }
-                        else if (!_awaitCastWarned)
+                        if (!_awaitCastWarned)
                         {
                             _awaitCastWarned = true;
-                            Service.ChatGui.PrintError($"段 {CurrentSegment + 1} 技能不可用（速行未解锁或冲刺 CD），自动重试中");
+                            Service.ChatGui.PrintError($"段 {CurrentSegment + 1} 需要慢跑/速行状态，当前无——请手动施放速行，或施放冲刺等待其结束变慢跑");
                         }
                     }
                 }
@@ -1495,7 +1581,7 @@ public unsafe sealed class ReplayEngine : IDisposable
 
             case ReplayState.PausedForStatus:
             {
-                // 常速段冲突暂停：等待玩家处理状态后点悬浮窗「继续」（Resume 恢复）或「终止」（Stop）。
+                // 常速段冲突暂停：等待玩家处理状态后点悬浮窗「继续」（Resume 恢复读档）或「终止」（Stop）。
                 // 期间不注入任何输入，玩家可自由行动。
                 break;
             }
@@ -1506,7 +1592,7 @@ public unsafe sealed class ReplayEngine : IDisposable
     /// 走位摔落/平台不符检测（三个走位状态共用）：走位中玩家高度与目标高度差持续超阈值 =
     /// 玩家已摔落或被障碍推下目标平台（实测段21 走位对齐中从平台摔落，Y 65→37 掉 27.6m，
     /// 插件仍持续注入把玩家拉向落点 → 与玩家手动走回互相拉扯（抢控制），且 XZ 到位后
-    /// 从错误高度执行下一段起跳）。检测到立即释放控制并失败，不再继续拉扯。
+    /// 从错误高度读档下一段起跳）。检测到立即释放控制并失败，不再继续拉扯。
     /// </summary>
     private bool CheckWalkFell(Vector3 playerPos, Vector3 targetPos, long now)
     {

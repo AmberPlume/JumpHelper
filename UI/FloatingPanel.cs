@@ -11,8 +11,8 @@ namespace JumpHelper.UI;
 /// 悬浮窗（主操作面）：只放最重要的按钮，小窗可拖拽。
 ///   - 开始记录 / 暂停记录 / 继续记录（三态合一的大按钮）+ 设置（右侧短按钮）
 ///   - 保存路线（存到当前路线）/ 路线列表（弹窗：列表/新建/加载/删除/导出）
-///   - 起点 ▾ / 终点 ▾（段选择下拉）
-///   - 执行 / 终止（同一按钮，回放中自动切换）
+///   - 起点 ▾ / 终点 ▾（段选择下拉，仅线性模式）
+///   - 执行 / 终止（同一按钮，回放中自动切换；「执行」= 读档跳回）
 ///   - 快速读档（自动找最近同 Y 落点 → 跳到最远进度）/ 快速删除（删最后一段）
 /// 世界标记的起终点图标由本窗的段选择驱动（RouteOverlay.StartSegment/EndSegment）。
 /// </summary>
@@ -41,7 +41,9 @@ public sealed class FloatingPanel : Window
     private bool _segEditOpen;
     private string _newRouteName = "";
     private string[] _routeNames = Array.Empty<string>();
-    private string[] _routeMapLabels = Array.Empty<string>(); // 与 _routeNames 对应的地图名缓存（每秒刷新一次）
+    private string[] _routeMapLabels = Array.Empty<string>(); // 与 _routeNames 对应的地图名缓存（分列表格第二列，每秒刷新一次）
+    private string[] _routeModeLabels = Array.Empty<string>(); // 与 _routeNames 对应的段落模式缓存（分列表格第三列，每秒刷新一次）
+    private string[] _routeStatusLabels = Array.Empty<string>(); // 与 _routeNames 对应的移速状态汇总缓存（分列表格第四列，每秒刷新一次）
     private int _selectedRoute;
     private long _lastRouteRefresh;
     private string _pendingOverwriteName = "";
@@ -109,9 +111,14 @@ public sealed class FloatingPanel : Window
             StartSegSel = route is { Segments.Count: > 0 } ? -2 : -1;
             EndSegSel = route is { Segments.Count: > 0 } ? -2 : -1;
         }
-        // 段选择合法性收敛（-2 = 就近/最远哨兵值，-1 = 无选择，≥0 = 具体段）
+        // 段选择合法性收敛（-2 = 就近/最远哨兵值，-1 = 无选择，≥0 = 具体段）。
+        // 取消"未选"态：只要路线已有段，起点/终点一律落到默认（就近 / 最远）。
+        // 关键：新建空路线后给同一条路线加首段（_lastRouteRef 相同，上方路线切换检测不触发），
+        // 旧 -1"未选"会残留——这里兜底把 -1 收敛回默认值。
         if (segCount > 0)
         {
+            if (StartSegSel == -1) StartSegSel = -2;
+            if (EndSegSel == -1) EndSegSel = -2;
             if (StartSegSel >= segCount) StartSegSel = -2;
             if (EndSegSel >= segCount) EndSegSel = -2;
             if (StartSegSel >= 0 && EndSegSel >= 0 && EndSegSel < StartSegSel) EndSegSel = StartSegSel;
@@ -125,17 +132,54 @@ public sealed class FloatingPanel : Window
         var spacing = ImGui.GetStyle().ItemSpacing.X;
         var w = ImGui.GetContentRegionAvail().X; // 固定宽度窗口下稳定
 
-        // 行1：开始记录（长，占剩余）+ 设置（短，右侧）
-        var setW = ImGui.CalcTextSize("设置").X + ImGui.GetStyle().FramePadding.X * 2;
-        DrawRecordButton(w - setW - spacing);
-        ImGui.SameLine();
-        if (ImGui.Button("设置", new Vector2(setW, 30)))
-            _mainWindow.Toggle();
+        // 行0：段落记录方式切换（线性 / 碎片）——仅「当前」按钮着淡色高亮（淡蓝=线性、淡橙=碎片）用以区分，
+        // 未选中态与普通按钮一致（含悬停变亮）。两个按钮并排占满整行、高度与其他行统一。
+        // 切换模式后强制「重新选择或新建路线」：卸载当前路线（自动保存），防止旧模式录的路线被新模式接着录。
+        var modeW = (w - spacing) * 0.5f;
+        if (Service.Config.SegmentMode == SegmentMode.Linear)
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.62f, 0.72f, 0.87f, 1f)); // 淡蓝
+        if (ImGui.Button("线性", new Vector2(modeW, 0)))
+            SwitchMode(SegmentMode.Linear, "线性：按段序号顺序依次跳跃，落点不自动衔接");
+        if (Service.Config.SegmentMode == SegmentMode.Linear)
+            ImGui.PopStyleColor();
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("打开设置窗口（主面板/容差参数/移动状态）");
+            ImGui.SetTooltip("线性：按段序号依次跳跃——连续不分段的常规地图（切换需重选/新建路线）");
+        ImGui.SameLine();
+        if (Service.Config.SegmentMode == SegmentMode.Fragment)
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.96f, 0.76f, 0.48f, 1f)); // 淡橙
+        if (ImGui.Button("碎片", new Vector2(modeW, 0)))
+            SwitchMode(SegmentMode.Fragment, "碎片：数字仅作段名，落地后按距离/高度自动衔接，岔路需手动选择");
+        if (Service.Config.SegmentMode == SegmentMode.Fragment)
+            ImGui.PopStyleColor();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("碎片：先去左边跳一小段、再去右边跳一小段的分散地图——按落点→起跳点距离/高度自动衔接，岔路暂停选择（切换需重选/新建路线）");
         ImGui.Spacing();
 
-        // 行2：保存路线 + 路线列表（等宽填满；路线列表始终可点——弹窗含新建/导入，无路线也能用）
+        // 行0.5：当前路线信息（名称 + 移速状态）+ 路线列表按钮（右侧）——模式切换下方、记录按钮上方。
+        // 速度信息 = 路线的移速状态汇总（常速/冲刺/慢跑·速行/慢走 组合），与路线列表「速度」列一致。
+        // 路线列表按钮始终可点（弹窗含新建/导入，无路线也能用）；设置按钮在下方与保存路线同排。
+        var setW = ImGui.CalcTextSize("路线列表").X + ImGui.GetStyle().FramePadding.X * 2;
+        var speedText = route != null ? route.MoveStateSummary() : "";
+        var speedW = speedText.Length > 0 ? ImGui.CalcTextSize(speedText).X : 0f;
+        var infoNameW = w - setW - speedW - spacing * 3;
+        ImGui.TextUnformatted(route != null ? TruncateText(route.Name, infoNameW) : "未加载路线");
+        if (route != null && speedText.Length > 0)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled(speedText);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("路线列表", new Vector2(setW, 0)))
+            _routeListOpen = true;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("管理路线：新建/加载/删除/导出/改目录，双击直接加载");
+        ImGui.Spacing();
+
+        // 行1：开始记录（独占一行；按钮加高 1.5 倍便于点击）
+        DrawRecordButton(w);
+        ImGui.Spacing();
+
+        // 行2：保存路线 + 设置（等宽填满；设置始终可点）
         var halfW = (w - spacing) * 0.5f;
         if (!hasRoute) ImGui.BeginDisabled();
         if (ImGui.Button("保存路线", new Vector2(halfW, 0)))
@@ -144,15 +188,16 @@ public sealed class FloatingPanel : Window
             ImGui.SetTooltip("保存当前路线到文件");
         if (!hasRoute) ImGui.EndDisabled();
         ImGui.SameLine();
-        if (ImGui.Button("路线列表", new Vector2(halfW, 0)))
-            _routeListOpen = true;
+        if (ImGui.Button("设置", new Vector2(halfW, 0)))
+            _mainWindow.Toggle();
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("管理路线：新建/加载/删除/导出/改目录，双击直接加载");
+            ImGui.SetTooltip("打开设置窗口（基础设置/参数设置）");
         ImGui.Spacing();
 
         // 行3：起点/终点下拉（无 label 并排——悬浮窗窄，preview 文案带"起点/终点"）
         // 起点：就近（-2，默认）= 自动取最近的段落起点；终点：最远（-2，默认）= 最后一段。
-        if (segCount > 0)
+        // 仅在【线性】模式显示——碎片模式无起点/终点概念（哪个起跳点近自动去哪个）。
+        if (segCount > 0 && Service.Config.SegmentMode == SegmentMode.Linear)
         {
             ImGui.SetNextItemWidth(halfW);
             var startLabel = StartSegSel == -2 ? "起点·就近" : StartSegSel >= 0 ? $"起点·段{StartSegSel + 1}" : "起点·未选";
@@ -198,26 +243,39 @@ public sealed class FloatingPanel : Window
             ImGui.Spacing();
         }
 
-        // 行4：执行 / 继续 / 终止 合一（占满整行）：
-        //   空闲显示「执行」（起点→终点回放）；常速冲突暂停显示「继续」（处理状态后恢复）；回放中显示「终止」
+        // 行4：路线回放 / 继续 / 终止（占满整行）。「路线回放」即读档跳回：对当前已加载路线从就近段跳到最远段。
+        // 线性模式按起点/终点下拉；碎片模式无起点/终点，就近起跳点自动衔接。常速冲突暂停显示「继续」。
         var pausedForStatus = _replay.State == ReplayState.PausedForStatus;
+        var pausedForBranch = _replay.State == ReplayState.PausedForBranch;
         var replaying = _replay.State != ReplayState.Idle && _replay.State != ReplayState.Failed;
-        var canRun = hasRoute && segCount > 0 && StartSegSel != -1 && EndSegSel != -1;
+        var isLinear = Service.Config.SegmentMode == SegmentMode.Linear;
+        var canRun = isLinear
+            ? hasRoute && segCount > 0 && StartSegSel != -1 && EndSegSel != -1
+            : hasRoute && segCount > 0; // 碎片模式无需起点/终点下拉
         if (!replaying && !canRun && !pausedForStatus) ImGui.BeginDisabled();
-        var runLabel = pausedForStatus ? "继 续" : replaying ? "终 止" : "执 行";
-        if (ImGui.Button(runLabel, new Vector2(w, 34)))
+        var runLabel = pausedForStatus ? "继 续" : replaying ? "终 止" : "路线回放";
+        if (ImGui.Button(runLabel, new Vector2(w, 51)))
         {
             if (pausedForStatus)
                 _replay.Resume();
             else if (replaying)
                 StopAll();
-            else
+            else if (isLinear)
                 RunSelection();
+            else
+                LoadAndJumpBack();
         }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip(pausedForStatus
-                ? "处理移速状态后继续回放（未处理则带状态硬跳，自担跳过头风险）"
-                : replaying ? "终止当前回放" : "从起点段回放到终点段");
+        {
+            if (pausedForStatus)
+                ImGui.SetTooltip("处理移速状态后继续回放");
+            else if (replaying)
+                ImGui.SetTooltip("终止当前回放");
+            else if (isLinear)
+                ImGui.SetTooltip("路线回放（读档跳回：按起点/终点选择回放）");
+            else
+                ImGui.SetTooltip("碎片模式：从最近的起跳点开始路线回放（读档跳回；水平≤XZ 且 |ΔY|≤Y）");
+        }
         if (!replaying && !canRun && !pausedForStatus) ImGui.EndDisabled();
         ImGui.Spacing();
 
@@ -235,50 +293,24 @@ public sealed class FloatingPanel : Window
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("删除最后一段（误跳/录歪时）");
 
-        // 行6：段落编辑（整行，自适应宽度）
-        if (ImGui.Button("段落编辑", new Vector2(w, 0)))
+        // 行6：插入新段（仅线性模式；碎片段落由距离衔接，插入无意义）+ 段落编辑（同一行并排）
+        var isLinearNow = Service.Config.SegmentMode == SegmentMode.Linear;
+        if (isLinearNow)
+        {
+            if (ImGui.Button("插入新段", new Vector2(halfW, 0)))
+            {
+                if (_recorder.InsertNewSegment())
+                    _segEditOpen = false; // 插入开始，关闭段落编辑窗（玩家直接跳一跳补录）
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("以就近（同高度 |Y差|≤插入容差、XZ最近）落点段为基准，在其后插入新段——下一跳记录为该段后一位（后续段顺延），解决\"删段后无法补录原段序号\"问题");
+            ImGui.SameLine();
+        }
+        if (ImGui.Button("段落编辑", new Vector2(isLinearNow ? halfW : w, 0)))
             _segEditOpen = true;
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("管理段落：重录/截断/删除/扩展标记");
+            ImGui.SetTooltip("管理段落：重录/删除/扩展标记" + (isLinearNow ? "（线性模式另有截断/插入）" : "（碎片模式仅重录/删除）"));
         ImGui.Spacing();
-
-        // 行7：标定跳跃（调试：<< >> 步进 0.1，< > 步进 0.01，中间距离可直输，右侧跳跃按钮）
-        var calTinyW = ImGui.CalcTextSize(">>").X + ImGui.GetStyle().FramePadding.X * 2 + 2;
-        var calSmallW = ImGui.CalcTextSize("<").X + ImGui.GetStyle().FramePadding.X * 2 + 2;
-        var calJumpW = ImGui.CalcTextSize("跳 跃").X + ImGui.GetStyle().FramePadding.X * 2 + 8;
-        var calInputW = w - calTinyW * 2 - calSmallW * 2 - calJumpW - spacing * 4;
-        if (ImGui.Button("<<##cal", new Vector2(calTinyW, 0)))
-            _calibDist = MathF.Max(0f, _calibDist - 0.1f);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("助跑距离 -0.1m");
-        ImGui.SameLine();
-        if (ImGui.Button("<##cal", new Vector2(calSmallW, 0)))
-            _calibDist = MathF.Max(0f, _calibDist - 0.01f);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("助跑距离 -0.01m");
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(calInputW);
-        var calDist = _calibDist;
-        // step=0 隐藏 InputFloat 自带的 -/+ 按钮（步进已由 << < > >> 提供）
-        if (ImGui.InputFloat("##caldist", ref calDist, 0f, 0f, "%.3f"))
-            _calibDist = Math.Clamp(calDist, 0f, 20f);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("助跑距离（米）——可点击直接输入");
-        ImGui.SameLine();
-        if (ImGui.Button(">##cal", new Vector2(calSmallW, 0)))
-            _calibDist = MathF.Min(20f, _calibDist + 0.01f);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("助跑距离 +0.01m");
-        ImGui.SameLine();
-        if (ImGui.Button(">>##cal", new Vector2(calTinyW, 0)))
-            _calibDist = MathF.Min(20f, _calibDist + 0.1f);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("助跑距离 +0.1m");
-        ImGui.SameLine();
-        if (ImGui.Button("跳 跃", new Vector2(calJumpW, 0)))
-            _replay.StartCalibration(_calibDist);
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("按照指定的助跑距离跳跃一次，常速时，预计0.35m将达到最大跳跃距离");
 
         // 状态提示：等待玩家手动走到下一段起跳点（段间长距离半自动）/ 常速冲突暂停
         if (_replay.State == ReplayState.AwaitPlayer)
@@ -294,6 +326,36 @@ public sealed class FloatingPanel : Window
                 $"段 {_replay.CurrentSegment + 1} 为常速但当前带移速状态——点「继续」或「终止」");
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("录制常速、当前带冲刺/慢跑/速行会跳过头——清除移速状态后点「继续」（进战斗/切职业可清除；大缓冲平台可带状态硬跳）");
+        }
+        else if (pausedForBranch)
+        {
+            ImGui.TextColored(new Vector4(0.9f, 0.45f, 0.1f, 1f),
+                $"碎片岔路：段 {_replay.CurrentSegment + 1} 附近 {_replay.BranchCandidates.Count} 个候选——请在弹窗选择下一个段落");
+        }
+
+        // 碎片岔路选择弹窗（普通非模态）：列出候选段起跳点（段号+坐标），玩家点选即继续
+        if (pausedForBranch && _replay.BranchCandidates.Count > 0)
+        {
+            ImGui.SetNextWindowSize(new Vector2(340, 0), ImGuiCond.Always);
+            if (ImGui.Begin("碎片岔路——选择下段", ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.AlwaysAutoResize))
+            {
+                ImGui.TextColored(new Vector4(0.9f, 0.45f, 0.1f, 1f),
+                    $"当前在段 {_replay.CurrentSegment + 1} 落点，附近有 {_replay.BranchCandidates.Count} 个可衔接起跳点：");
+                ImGui.Spacing();
+                foreach (var c in _replay.BranchCandidates)
+                {
+                    var t = _replay.CurrentRoute.Segments[c].Takeoff;
+                    var row = $"段 {c + 1}  ({t.X:F0}, {t.Y:F0}, {t.Z:F0})";
+                    if (ImGui.Button(row, new Vector2(320, 26)))
+                        _replay.ChooseBranch(c);
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("跳到该段的起跳点并执行——选中后按此段继续");
+                }
+                ImGui.Spacing();
+                if (ImGui.Button("取消（终止）", new Vector2(320, 26)))
+                    StopAll();
+                ImGui.End();
+            }
         }
 
         // 段落编辑窗口（普通非模态）：段列表 + 重录/截断/删除
@@ -330,8 +392,29 @@ public sealed class FloatingPanel : Window
         }
     }
 
-    /// <summary>执行：起点段 → 终点段 回放（纯跳回，不丢弃段）。
-    /// 起点「就近」= 自动取最近的段落起点（XZ 最近且同平台）；终点「最远」= 最后一段。</summary>
+    /// <summary>路线回放：对当前（已加载）路线从「就近段」跳到「最远段」。起点「就近」= 自动取最近的段落起点
+    /// （XZ 最近且同 Y）；终点「最远」= 最后一段。线性 / 碎片模式通用（悬浮窗「路线回放」按钮用）。</summary>
+    private void LoadAndJumpBack()
+    {
+        var route = _recorder.CurrentRoute;
+        if (route == null || route.Segments.Count == 0)
+        {
+            Service.ChatGui.PrintError("无路线或尚无段");
+            return;
+        }
+        var start = FindNearestTakeoffSegment(route);
+        if (start < 0)
+        {
+            Service.ChatGui.PrintError("附近无段落起点，请先走到路线起点附近");
+            return;
+        }
+        var end = route.Segments.Count - 1;
+        if (start > end) start = end; // 防御收敛：就近起点不可能超过最后一段（正常不可达），防死代码提示
+        _replay.StartRouteSegments(route, start, end);
+    }
+
+    /// <summary>路线回放：按悬浮窗下拉选择的起点段 → 终点段 回放当前已加载路线（线性模式用）。
+    /// 起点「就近」= 自动取最近的段落起点；终点「最远」= 最后一段。</summary>
     private void RunSelection()
     {
         var route = _recorder.CurrentRoute;
@@ -346,26 +429,26 @@ public sealed class FloatingPanel : Window
             return;
         }
 
-        // 解析起点：就近 = 自动找最近的段落起点
         var start = StartSegSel;
         if (start == -2)
         {
             start = FindNearestTakeoffSegment(route);
             if (start < 0)
             {
-                Service.ChatGui.PrintError("就近失败：当前位置附近（同平台）无段落起点，请先走到路线起点附近或手动选段");
+                Service.ChatGui.PrintError("附近无段落起点，请先走到路线起点附近或手动选段");
                 return;
             }
         }
-        // 解析终点：最远 = 最后一段
         var end = EndSegSel;
         if (end == -2)
             end = route.Segments.Count - 1;
 
         if (start > end)
         {
-            Service.ChatGui.PrintError($"就近起点（段 {start + 1}）已在终点（段 {end + 1}）之后——请调整终点或手动选起点段");
-            return;
+            // 就近起点已越过所选终点（玩家实际站在终点段之后）：终点自动收敛到起点段，
+            // 杜绝"起点>终点"的无意义区间（选择上已尽量约束，就近是动态的，此处兜底静默收敛）
+            PluginLog.Info($"RunSelection: 就近起点段 {start + 1} 已越过所选终点段，终点自动收敛为起点段");
+            end = start;
         }
         if (end >= route.Segments.Count)
         {
@@ -375,7 +458,7 @@ public sealed class FloatingPanel : Window
         _replay.StartRouteSegments(route, start, end);
     }
 
-    /// <summary>就近起点：遍历段起跳点，找 XZ 最近且 |Y差| ≤ YAlignTolerance 的段（同平台）；无匹配返回 -1。</summary>
+    /// <summary>就近起点：遍历段起跳点，找 XZ 最近且 |Y差| ≤ 当前模式 Y 容差的段（同平台）；无匹配返回 -1。</summary>
     private int FindNearestTakeoffSegment(RouteFile route)
     {
         var player = Service.ObjectTable.LocalPlayer;
@@ -383,10 +466,13 @@ public sealed class FloatingPanel : Window
             return -1;
         int best = -1;
         var bestD = float.MaxValue;
+        var yTol = Service.Config.SegmentMode == SegmentMode.Fragment
+            ? Service.Config.FragYAlignTolerance
+            : Service.Config.YAlignTolerance;
         for (int i = 0; i < route.Segments.Count; i++)
         {
             var t = route.Segments[i].Takeoff;
-            if (MathF.Abs(t.Y - player.Position.Y) > Service.Config.YAlignTolerance)
+            if (MathF.Abs(t.Y - player.Position.Y) > yTol)
                 continue;
             var dx = t.X - player.Position.X;
             var dz = t.Z - player.Position.Z;
@@ -412,7 +498,7 @@ public sealed class FloatingPanel : Window
         var idx = FindNearestTakeoffSegment(route);
         if (idx < 0)
         {
-            Service.ChatGui.PrintError("就近无段落起点（同平台）——请靠近要重录的段");
+            Service.ChatGui.PrintError("当前位置与任一段起跳点距离过远，无法重录，请走到要重录的段起跳点附近");
             return;
         }
         _recorder.RerecordFrom(idx);
@@ -431,25 +517,29 @@ public sealed class FloatingPanel : Window
         }
 
         ImGui.Text($"当前路线 [{route.Name}]：{route.Segments.Count} 段——段落是玩家参考的基本单位（序号对应世界标记）");
+        // 「插入新段」按钮已移至悬浮窗（线性模式独有）；碎片模式段落无序号、由距离衔接，插入无意义。
         var extEnabled = Service.Config.ExtendedTimeline;
+        var isLinear = Service.Config.SegmentMode == SegmentMode.Linear;
         if (extEnabled)
-            ImGui.TextDisabled("扩展时间线已开启：勾选某段「扩展」并重录 = 段间行走完整复现（自装修跳跳乐高精度场景）");
+            ImGui.TextDisabled("扩展时间线已开启，新的段落的操作将会被更完整的记录。");
+        if (Service.Config.SegmentMode == SegmentMode.Fragment)
+            ImGui.TextDisabled("碎片模式：段落仅按距离/高度衔接，无「截断」——删除多余段用「删除」");
         ImGui.Spacing();
 
-        // 列数随扩展开关变化：扩展关闭时隐藏「扩展」列
-        var colCount = extEnabled ? 5 : 4;
+        // 列数随扩展开关与模式变化：扩展列（开启时）+ 截断列（仅线性）。基础列 = 段/重录/删除。
+        var colCount = 3 + (extEnabled ? 1 : 0) + (isLinear ? 1 : 0);
+        var headers = new[] { "段", "重录", "截断", "删除" }
+            .Where(h => h != "截断" || isLinear)
+            .Concat(extEnabled ? new[] { "扩展" } : Array.Empty<string>())
+            .ToArray();
         if (ImGui.BeginTable("##segedit", colCount, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
         {
-            ImGui.TableSetupColumn("段");
-            if (extEnabled)
-                ImGui.TableSetupColumn("扩展");
-            ImGui.TableSetupColumn("重录");
-            ImGui.TableSetupColumn("截断");
-            ImGui.TableSetupColumn("删除");
+            foreach (var h in headers)
+            {
+                ImGui.TableSetupColumn(h);
+            }
             ImGui.TableNextRow(ImGuiTableRowFlags.Headers);
-            foreach (var h in extEnabled
-                         ? new[] { "段", "扩展", "重录", "截断", "删除" }
-                         : new[] { "段", "重录", "截断", "删除" })
+            foreach (var h in headers)
             {
                 ImGui.TableNextColumn();
                 CenterText(h);
@@ -489,15 +579,18 @@ public sealed class FloatingPanel : Window
                         ? "从该段行走起点重新走+跳（扩展时间线）"
                         : "从该段起跳点重新跳（需与该段起跳点同一 Y 轴）");
 
-                ImGui.TableNextColumn();
-                CenterWidget(ImGui.GetFrameHeight() * 2.6f);
-                if (ImGui.Button($"截断##c{i}"))
+                if (isLinear)
                 {
-                    if (_recorder.CutFrom(i))
-                        break; // 段数变化，结束本帧（下一帧重绘）
+                    ImGui.TableNextColumn();
+                    CenterWidget(ImGui.GetFrameHeight() * 2.6f);
+                    if (ImGui.Button($"截断##c{i}"))
+                    {
+                        if (_recorder.CutFrom(i))
+                            break; // 段数变化，结束本帧（下一帧重绘）
+                    }
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip("删除该段及之后所有段（后半段重录用）");
                 }
-                if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip("删除该段及之后所有段（后半段重录用）");
 
                 ImGui.TableNextColumn();
                 CenterWidget(ImGui.GetFrameHeight() * 2.6f);
@@ -511,6 +604,20 @@ public sealed class FloatingPanel : Window
         }
         ImGui.Spacing();
         ImGui.TextDisabled("重录=替换该段；截断=清掉该段及之后；删除=只删该段；扩展=段间行走完整复现（重录生效）。");
+    }
+
+    /// <summary>按像素宽度截断文本（超出加 …，供信息行路线名显示）。</summary>
+    private static string TruncateText(string s, float maxW)
+    {
+        if (maxW <= 8 || string.IsNullOrEmpty(s))
+            return "";
+        if (ImGui.CalcTextSize(s).X <= maxW)
+            return s;
+        const string ell = "…";
+        var res = s;
+        while (res.Length > 1 && ImGui.CalcTextSize(res + ell).X > maxW)
+            res = res[..^1];
+        return res + ell;
     }
 
     /// <summary>段落编辑窗内表格单元格居中文本。</summary>
@@ -540,8 +647,10 @@ public sealed class FloatingPanel : Window
             _lastRouteRefresh = Environment.TickCount64;
             _routeNames = _routeStore.ListRouteNames().ToArray();
             _routeMapLabels = new string[_routeNames.Length];
+            _routeModeLabels = new string[_routeNames.Length];
+            _routeStatusLabels = new string[_routeNames.Length];
             for (int i = 0; i < _routeNames.Length; i++)
-                _routeMapLabels[i] = DescribeRoute(_routeNames[i]);
+                DescribeRoute(_routeNames[i], out _routeMapLabels[i], out _routeModeLabels[i], out _routeStatusLabels[i]);
             if (_selectedRoute >= _routeNames.Length)
                 _selectedRoute = Math.Max(0, _routeNames.Length - 1);
         }
@@ -550,7 +659,7 @@ public sealed class FloatingPanel : Window
         var spacing = ImGui.GetStyle().ItemSpacing.X;
         var btnW = (w - spacing * 4) * 0.2f;
 
-        // 操作行：新建 / 加载 / 删除（未按 Ctrl 灰暗不可点，按下亮起）/ 导出 / 目录
+        // 操作行：新建 / 加载 / 删除（未按 Ctrl 灰暗不可点）/ 导出 / 目录
         if (ImGui.Button("新建", new Vector2(btnW, 0)))
             _newRouteOpen = true;
         if (ImGui.IsItemHovered())
@@ -599,40 +708,83 @@ public sealed class FloatingPanel : Window
             return;
         }
 
-        // 路线列表：名称 + 录制地图名（缓存数组，每秒刷新时一次性计算——避免每帧 Load JSON）
-        for (int i = 0; i < _routeNames.Length; i++)
+        // 路线列表（分列表格）：路线名称 | 地图 | 模式 | 速度状态。缓存数组每秒刷新时一次性计算——
+        // 避免每帧 Load JSON（DescribeRoute 内部读文件+解析，路线多时掉帧）。
+        if (ImGui.BeginTable("##routelist", 4, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY, new Vector2(w, 0)))
         {
-            var mapLabel = i < _routeMapLabels.Length ? _routeMapLabels[i] : "未知";
-            if (ImGui.Selectable($"{_routeNames[i]}  [{mapLabel}]", i == _selectedRoute))
-                _selectedRoute = i;
-            // 双击 = 直接加载（切换时自动保存当前路线）
-            if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+            ImGui.TableSetupColumn("名称", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("地图", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("模式", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("速度", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableNextRow(ImGuiTableRowFlags.Headers);
+            foreach (var h in new[] { "名称", "地图", "模式", "速度" })
             {
-                if (_recorder.LoadRouteForRecord(_routeNames[i]))
-                    _routeListOpen = false;
-                else
-                    Service.ChatGui.PrintError("加载失败（查看日志）");
+                ImGui.TableNextColumn();
+                CenterText(h);
             }
+
+            for (int i = 0; i < _routeNames.Length; i++)
+            {
+                var name = _routeNames[i];
+                var mapLabel = i < _routeMapLabels.Length ? _routeMapLabels[i] : "未知";
+                var modeLabel = i < _routeModeLabels.Length ? _routeModeLabels[i] : "未知";
+                var statusLabel = i < _routeStatusLabels.Length ? _routeStatusLabels[i] : "";
+                bool loadRequested = false;
+
+                ImGui.TableNextRow();
+                ImGui.TableSetColumnIndex(0);
+                // SpanAllColumns：整行可点击选中（点击地图/模式/状态列同样选中），双击直接加载。
+                // Selectable 不支持文本居中——用空 label 提供整行命中区，之后覆盖绘制居中文本。
+                var rowCellPos = ImGui.GetCursorPos();
+                var col0W = ImGui.GetColumnWidth();
+                if (ImGui.Selectable($"##row{i}", i == _selectedRoute, ImGuiSelectableFlags.SpanAllColumns))
+                    _selectedRoute = i;
+                if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
+                    loadRequested = true;
+                var nameW = ImGui.CalcTextSize(name).X;
+                ImGui.SetCursorPos(rowCellPos);
+                ImGui.SetCursorPosX(rowCellPos.X + MathF.Max(0f, (col0W - nameW) * 0.5f));
+                ImGui.TextUnformatted(name);
+                ImGui.TableSetColumnIndex(1);
+                CenterText(mapLabel);
+                ImGui.TableSetColumnIndex(2);
+                CenterText(modeLabel);
+                ImGui.TableSetColumnIndex(3);
+                CenterText(statusLabel);
+
+                if (loadRequested)
+                {
+                    if (_recorder.LoadRouteForRecord(name))
+                        _routeListOpen = false;
+                    else
+                        Service.ChatGui.PrintError("加载失败（查看日志）");
+                }
+            }
+            ImGui.EndTable();
         }
     }
 
-    /// <summary>路线描述：录制地图名 + 移速状态汇总（常速/冲刺/慢跑速行组合）。
-    /// 旧路线无 TerritoryName 字段 → 按 TerritoryId 动态查表（缓存）。</summary>
-    private string DescribeRoute(string name)
+    /// <summary>路线描述（分列）：「地图」= 录制地图名（旧路线按 TerritoryId 查表）；「模式」= 路线段落方式；
+    /// 「状态」= 移速状态汇总（常速 / 冲刺 / 慢跑·速行 / 慢走 组合——起跳速度一致性提示）。加载失败时取"未知"/空。</summary>
+    private void DescribeRoute(string name, out string mapLabel, out string modeLabel, out string statusLabel)
     {
+        mapLabel = "未知";
+        modeLabel = "未知";
+        statusLabel = "";
         try
         {
             var route = _routeStore.Load(name);
             if (route == null)
-                return "未知";
-            var map = !string.IsNullOrWhiteSpace(route.TerritoryName)
+                return;
+            mapLabel = !string.IsNullOrWhiteSpace(route.TerritoryName)
                 ? route.TerritoryName
                 : ResolveMapName(route.TerritoryId);
-            return $"{map}·{route.MoveStateSummary()}"; // 状态：常速 / 常速+冲刺+慢跑/速行（起跳速度一致性提示）
+            modeLabel = route.SegmentMode == SegmentMode.Linear ? "线性" : "碎片";
+            statusLabel = route.MoveStateSummary();
         }
         catch
         {
-            return "未知";
+            // 保持 未知/空
         }
     }
 
@@ -780,6 +932,30 @@ public sealed class FloatingPanel : Window
 
     // ===== 文件对话框（WinForms 需 STA 线程——统一实现见 Utils/Dialogs.cs） =====
 
+    /// <summary>切换段落记录方式（线性 / 碎片）。切换后强制「重新选择或新建路线」：先停回放，
+    /// 再卸载当前路线（自动保存），回归无路线状态——避免旧模式下录的路线被新模式直接接着录
+    /// （线性按序号跳、碎片按距离/高度衔接，衔接方式本质不同，绝不可混用）。</summary>
+    private void SwitchMode(SegmentMode target, string hint)
+    {
+        if (Service.Config.SegmentMode == target)
+            return;
+        var hadRoute = _recorder.CurrentRoute != null;
+        StopAll();
+        if (hadRoute)
+            _recorder.UnloadRoute();
+        _lastRouteRef = null; // 强制下一帧重置起点/终点选择
+        StartSegSel = -1;
+        EndSegSel = -1;
+        Service.Config.SegmentMode = target;
+        Service.Config.Save();
+        ChatInfo($"已切换到{hint}" + (hadRoute
+            ? "——原路线已卸载，请重新选择或新建路线"
+            : "——请新建或选择路线"));
+    }
+
+    /// <summary>聊天栏提示。</summary>
+    private static void ChatInfo(string msg) => Service.ChatGui.Print(msg);
+
     /// <summary>开始记录/暂停/继续 三态按钮（宽度由调用方传入，占满第一行剩余空间）。</summary>
     private void DrawRecordButton(float width)
     {
@@ -796,7 +972,7 @@ public sealed class FloatingPanel : Window
             label = "继续记录";
 
         if (!hasRoute) ImGui.BeginDisabled();
-        if (ImGui.Button(label, new Vector2(width, 30)))
+        if (ImGui.Button(label, new Vector2(width, 45)))
         {
             if (recording || paused)
                 _recorder.TogglePause();

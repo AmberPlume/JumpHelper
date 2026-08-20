@@ -1,4 +1,5 @@
 using Dalamud.Configuration;
+using JumpHelper.Models;
 
 namespace JumpHelper;
 
@@ -103,7 +104,7 @@ public class Configuration : IPluginConfiguration
 
     /// <summary>
     /// 等待玩家到位稳定时间（毫秒，默认 500）：玩家到达下一段起跳点附近后需**基本静止**持续此时间
-    /// 才确认到位并自动继续执行——防止"路过起跳点"误触发抢控制（玩家只是经过也会短暂进入范围）。
+    /// 才确认到位并自动继续读档——防止"路过起跳点"误触发抢控制（玩家只是经过也会短暂进入范围）。
     /// </summary>
     public float AwaitStableMs { get; set; } = 500f;
 
@@ -118,11 +119,35 @@ public class Configuration : IPluginConfiguration
     // ===== 移动状态（冲刺/慢跑/速行——起跳速度必须与录制一致，否则跳过头/跳不够） =====
 
     /// <summary>
-    /// 自动释放冲刺/速行开关（默认开启）：回放段需要冲刺/慢跑/速行状态而玩家当前没有时，
-    /// 自动施放对应技能补齐（冲刺 60s CD 前置检查、速行需职业解锁；施放后校验 buff 并聊天提醒）。
-    /// 关闭后：仅聊天提醒，不施放任何技能（玩家手动处理；未处理则回放因起跳速度不匹配失败）。
+    /// 自动释放冲刺开关（默认关闭）：回放段需要冲刺而玩家当前没有时，自动施放冲刺技能
+    /// （CD 前置检查，施放后校验 buff 并聊天提醒）。关闭后：仅聊天提醒，不施放任何技能
+    /// （玩家手动处理；未处理则回放因起跳速度不匹配失败）。
+    /// 注意：**速行（Peloton）永不自动施放**——跳跳乐副本内禁用速行，且慢跑持续时间无限；
+    /// 速行只作为"需要检测并提醒玩家"的影响速度状态（玩家手动施放，或施放冲刺等其结束变慢跑）。
     /// </summary>
-    public bool AutoCastMoveBuffs { get; set; } = true;
+    public bool AutoCastMoveBuffs { get; set; }
+
+    // ===== 段落记录方式（碎片/线性，二者参数互相独立） =====
+
+    /// <summary>
+    /// 段落记录方式：线性（按序号顺序依次跳跃，默认）/ 碎片（段落有序号但仅作"名字"，不依赖序号；
+    /// 落地后按"落点→起跳点"距离与高度自动衔接下一步，岔路让玩家选，找不出可衔接下阶段即终止）。
+    /// 详见 <see cref="SegmentMode"/>。
+    /// </summary>
+    public SegmentMode SegmentMode { get; set; } = SegmentMode.Linear;
+
+    /// <summary>碎片模式·Y 对齐容差（米）：与线性独立。碎片多起跳点近场易混淆，须收紧（默认 0.2，线性 0.3）。</summary>
+    public float FragYAlignTolerance { get; set; } = 0.2f;
+
+    /// <summary>碎片模式·水平衔接距离（米）：本段落点 → 下一起跳点水平距离 ≤ 此值才自动衔接（默认 3m）。</summary>
+    public float FragLinkDistXZ { get; set; } = 3f;
+
+    /// <summary>碎片模式·垂直衔接距离（米）：本段落点 → 下一起跳点 |ΔY| ≤ 此值才自动衔接（Y 绝不忽略）。</summary>
+    public float FragLinkDistY { get; set; } = 1f;
+
+    /// <summary>线性模式·插入段高度差（米）：「插入新段」找"就近落点段"时，|当前位置 Y − 落点 Y| ≤ 此值才视为候选。
+    /// 默认 0.2（比线性 Y 对齐 0.3 更紧——插入基准必须精确锁定到目标平台，近场多个落点不宜混淆）。</summary>
+    public float InsertSegmentYAlign { get; set; } = 0.2f;
 
     public void Save()
     {

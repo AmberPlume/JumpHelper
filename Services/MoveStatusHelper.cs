@@ -5,7 +5,7 @@ using Control = FFXIVClientStructs.FFXIV.Client.Game.Control.Control;
 namespace JumpHelper.Services;
 
 /// <summary>
-/// 移速状态工具（冲刺/慢跑/速行）：检测玩家当前移速 buff、自动施放冲刺/速行技能。
+/// 移速状态工具（冲刺/慢跑/速行）：检测玩家当前移速 buff、自动施放冲刺技能。
 ///
 /// 背景（用户实测结论，勿违背）：FF14 跳跃距离由起跳瞬间水平速度决定，移速 buff 直接改变起跳速度——
 /// 带移速加成跳"常速录制"的段会跳过头（小平台必跌）；状态必须完全一致才能确保回放成功率。
@@ -16,6 +16,10 @@ namespace JumpHelper.Services;
 ///   速行 Peloton：Action 7557（Recast100ms=50 → 5s CD，30s 持续，非战斗生效），弓/诗/机/舞职能技能 Lv20，
 ///                  Status 1199/1985。与慢跑同速（可互换）。
 /// 慢跑与速行在插件中合并为 MoveState.SlowBuff（同速处理）。
+///
+/// **自动施放只用于冲刺**（2026-08 用户定稿）：跳跳乐副本内禁用速行，且慢跑持续时间无限——
+/// 速行只作为"检测并提醒玩家"的影响速度状态（玩家手动施放，或施放冲刺等其结束变慢跑）。
+/// CastPeloton/PelotonRemainingSeconds 等速行施放能力保留备用，ReplayEngine 不再自动调用。
 ///
 /// 施放走游戏内部 ActionManager.UseAction（等价玩家按技能，零输入延迟、无需热键栏配置）——
 /// 参考 OmenTools UseActionManager 的 Hook.Original 调用方式；本机 FFXIVClientStructs 的

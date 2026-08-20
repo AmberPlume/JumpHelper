@@ -64,8 +64,15 @@ public sealed class RouteOverlay : IDisposable
         const float MaxOverlayDistSq = MaxOverlayDist * MaxOverlayDist;
         var playerPos = Service.ObjectTable.LocalPlayer.Position;
 
-        // 1. 段路径：起跳点(蓝) → 落点(白) 连线；回放当前段黄粗线；起点段绿、终点段红
-        var lineCol = replayActive ? 0x70FFFFFFu : 0x50FFFFFFu;
+        // 1. 段路径：起跳点(模式色) → 落点(白/模式色) 连线；回放当前段黄粗线；起点段绿、终点段红。
+        // 模式着色区分（避免"忘记录的是哪个模式"混淆）：线性 = 淡蓝（藏青浅化）、碎片 = 淡橙（亮橙浅化）。
+        // 线本体也按模式染色（需求9：染色对象是 Overlay 的线）——半透明保持不抢眼、起终点/当前段高亮不变。
+        var isFragment = Service.Config.SegmentMode == SegmentMode.Fragment;
+        var accentCol = isFragment ? 0xFFEBB064u : 0xFF7F9CD9;   // 模式主色：碎片淡橙 / 线性淡蓝
+        var accentHover = isFragment ? 0xFFF3CF9E : 0xFFB4C7ED;  // 模式浅色（序号文字等）
+        var lineCol = isFragment
+            ? (replayActive ? 0x90EBB064u : 0x70EBB064u)   // 碎片淡橙（半透明）
+            : (replayActive ? 0x907F9CD9u : 0x707F9CD9u);  // 线性淡蓝（半透明）
         for (int i = 0; i < route.Segments.Count; i++)
         {
             var seg = route.Segments[i];
@@ -92,13 +99,13 @@ public sealed class RouteOverlay : IDisposable
                 dl.AddLine(takeoffScr, landScr, segCol, thick);
             }
             if (takeoffVisible)
-                dl.AddCircleFilled(takeoffScr, isCurrent ? 5f : 3f, isCurrent ? 0xFFFFD040u : 0xFF30A0FFu, 16);
+                dl.AddCircleFilled(takeoffScr, isCurrent ? 5f : 3f, isCurrent ? 0xFFFFD040u : accentCol, 16);
             if (landVisible)
-                dl.AddCircleFilled(landScr, isCurrent ? 5f : 3f, isCurrent ? 0xFFFFD040u : 0xFFFFFFFFu, 16);
+                dl.AddCircleFilled(landScr, isCurrent ? 5f : 3f, isCurrent ? 0xFFFFD040u : (isFragment ? accentCol : 0xFFFFFFFFu), 16);
 
-            // 段序号：段中点沿垂线（水平面内垂直于线段的方向）正方向偏移 0.05m——序号贴在线段一侧，
-            // 不再垂直抬高（原 0.8m→0.4m 抬高用户仍觉离线段远，改用侧贴方案）。
-            // 放大 + 黑描边（用户反馈序号不明显——段落是玩家参考的基本单位，序号要大而清晰）
+            // 段序号（两种模式都画，作为"段名"；用不同色区分模式——线性藏青、碎片亮橙）：
+            // 段中点沿垂线（水平面内垂直于线段的方向）正方向偏移 0.05m——序号贴在线段一侧。
+            // 放大 + 黑描边（用户反馈序号不明显——段落是玩家参考的基本单位，序号要大而清晰）。
             var segDir = seg.Land - seg.Takeoff;
             segDir.Y = 0;
             var segDirLen = segDir.Length();
@@ -110,8 +117,8 @@ public sealed class RouteOverlay : IDisposable
             if (TryWorldToScreen(mid, out var midScr))
             {
                 const float numSize = 20f;
-                var numCol = isCurrent ? 0xFFFFD040u : 0xFFFFFFFFu;
-                var text = i.ToString(); // 避免每帧字符串插值分配（段号固定）
+                var numCol = isCurrent ? 0xFFFFD040u : accentHover;
+                var text = (i + 1).ToString(); // 段号从 1 开始（固定编号避免每帧字符串插值分配）
                 // 黑描边（4 方向偏移）提高对比度
                 foreach (var off in new[] { new Vector2(-1, 0), new Vector2(1, 0), new Vector2(0, -1), new Vector2(0, 1) })
                     dl.AddText(font, numSize, midScr + off, 0xFF000000u, text);

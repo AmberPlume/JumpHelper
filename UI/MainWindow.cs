@@ -1,5 +1,7 @@
+using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
+using JumpHelper.Models;
 using JumpHelper.Services;
 using JumpHelper.Utils;
 
@@ -7,7 +9,7 @@ namespace JumpHelper.UI;
 
 /// <summary>
 /// 主窗口（设置页）：主面板（显示/采集/移动状态开关）+ 参数设置（全部判定与物理参数）。
-/// 日常操作（记录/保存/路线列表/段落编辑/执行）全在悬浮窗 FloatingPanel。
+/// 日常操作（记录/保存/路线列表/段落编辑/路线回放）全在悬浮窗 FloatingPanel。
 /// 说明文本全部改为 hover 显示（鼠标移到控件上出现 tooltip），保持界面简洁。
 /// </summary>
 public sealed class MainWindow : Window
@@ -28,7 +30,7 @@ public sealed class MainWindow : Window
     {
         if (ImGui.BeginTabBar("##ja_main"))
         {
-            if (ImGui.BeginTabItem("主面板"))
+            if (ImGui.BeginTabItem("基础设置"))
             {
                 DrawMainTab();
                 ImGui.EndTabItem();
@@ -67,7 +69,7 @@ public sealed class MainWindow : Window
             OnFloatingPanelToggle?.Invoke(showPanel);
         }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("主操作面：记录/保存/路线/段落/执行/标定跳");
+            ImGui.SetTooltip("主操作面：记录/保存/路线/段落/路线回放");
 
         var autoSave = Service.Config.AutoSaveEvery;
         if (ImGui.DragInt("自动保存间隔（跳）", ref autoSave, 1f, 0, 100, autoSave > 0 ? $"{autoSave} 跳保存一次" : "关闭"))
@@ -77,6 +79,35 @@ public sealed class MainWindow : Window
         }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("每采集 N 段自动保存一次，0=关闭；切换/读档/卸载前的防丢保存跟随此开关");
+
+        var extTimeline = Service.Config.ExtendedTimeline;
+        if (ImGui.Checkbox("扩展时间线（默认关）##exttimeline", ref extTimeline))
+        {
+            Service.Config.ExtendedTimeline = extTimeline;
+            Service.Config.Save();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("段间长距离行走录进时间线完整复现（含拐弯/机关时序）——适合机制确定的自装修跳跳乐；段落编辑可逐段勾选「扩展」");
+
+        ImGui.Separator();
+
+        // 角色操作模式：直接写游戏配置 MoveMode（0=标准 1=传统），立即生效；加载路线时会自动切到路线录制模式
+        ImGui.Text("角色操作模式");
+        var curLegacy = Service.GameConfig.UiControl.TryGetUInt("MoveMode", out var moveMode) && moveMode == 1;
+        var modeBtnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+        if (!curLegacy) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.62f, 0.72f, 0.87f, 1f)); // 当前=标准 淡蓝
+        if (ImGui.Button("标准模式", new Vector2(modeBtnW, 0)))
+            SwitchMoveMode(0);
+        if (!curLegacy) ImGui.PopStyleColor();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("移动相对角色朝向——跳跳乐助手路线均按标准模式录制/回放（推荐）");
+        ImGui.SameLine();
+        if (curLegacy) ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.96f, 0.76f, 0.48f, 1f)); // 当前=传统 淡橙
+        if (ImGui.Button("传统模式", new Vector2(modeBtnW, 0)))
+            SwitchMoveMode(1);
+        if (curLegacy) ImGui.PopStyleColor();
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("移动相对相机方位——回放方向不可复现，传统模式录的路线回放必偏");
 
         ImGui.Separator();
 
@@ -94,22 +125,6 @@ public sealed class MainWindow : Window
                 () => Service.Config.FellDropHeight, v => Service.Config.FellDropHeight = v, 0.1f, 0.5f, 20f,
                 "落点比起跳点低超过此值视为跌落段并丢弃");
         }
-
-        DrawFloat("段间行走分流阈值 m", "##longwalk",
-            () => Service.Config.LongWalkDist, v => Service.Config.LongWalkDist = v, 0.1f, 0.5f, 20f,
-            "落点→下一起跳点位移超过此值=长路径段（交玩家手动走，到位后自动继续）；短路径段自动衔接");
-        DrawFloat("到位稳定确认 ms", "##awaitstable",
-            () => Service.Config.AwaitStableMs, v => Service.Config.AwaitStableMs = v, 10f, 0f, 5000f,
-            "到达起跳点附近后基本静止持续此时间才继续（防路过误触发）");
-
-        var extTimeline = Service.Config.ExtendedTimeline;
-        if (ImGui.Checkbox("扩展时间线（默认关）", ref extTimeline))
-        {
-            Service.Config.ExtendedTimeline = extTimeline;
-            Service.Config.Save();
-        }
-        if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("段间长距离行走录进时间线完整复现（含拐弯/机关时序）——适合机制确定的自装修跳跳乐；段落编辑可逐段勾选「扩展」");
 
         ImGui.Separator();
 
@@ -137,13 +152,13 @@ public sealed class MainWindow : Window
         ImGui.Text("移动状态");
 
         var autoCast = Service.Config.AutoCastMoveBuffs;
-        if (ImGui.Checkbox("自动释放冲刺/速行", ref autoCast))
+        if (ImGui.Checkbox("自动释放冲刺（默认关）##autocast", ref autoCast))
         {
             Service.Config.AutoCastMoveBuffs = autoCast;
             Service.Config.Save();
         }
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("录制与回放的移速状态必须一致（否则起跳速度不匹配跳过头/跳不够）。开启：回放缺冲刺/慢跑/速行时自动施放技能补齐并提醒；关闭：仅提醒不施放。常速段带状态会暂停等玩家处理");
+            ImGui.SetTooltip("回放段需要冲刺而当前没有时自动施放冲刺（默认关闭=仅提醒）。速行永不自动施放——副本内禁用且慢跑无限，只做检测提醒（玩家手动施放，或施放冲刺等其结束变慢跑）");
     }
 
     // ===== 参数设置页：全部判定/物理参数 =====
@@ -153,12 +168,12 @@ public sealed class MainWindow : Window
         ImGui.TextDisabled("参数拖动即保存生效，回放中可实时调整观察");
         ImGui.Separator();
 
+        // ===== 核心功能（线性/碎片共用）：这一跳能否成功 / 起点速度对齐 =====
+        ImGui.Text("核心功能");
+        ImGui.Separator();
         DrawFloat("对齐容差 m", "##align",
             () => Service.Config.AlignTolerance, v => Service.Config.AlignTolerance = v, 0.001f, 0f, 0.2f,
             "起点/冲刺起点/落点走位对齐的判定容差（游戏位置精度 0.001m）");
-        DrawFloat("Y 轴对齐容差 m", "##yalign",
-            () => Service.Config.YAlignTolerance, v => Service.Config.YAlignTolerance = v, 0.01f, 0f, 1f,
-            "读档起点高度匹配/到位判定/重录校验——路不平的地图放宽到 0.3，平整地图可调小");
         DrawFloat("起跳沿向窗口 m", "##along",
             () => Service.Config.TakeoffAlongTolerance, v => Service.Config.TakeoffAlongTolerance = v, 0.001f, 0f, 0.2f,
             "距起跳点 ≤ 此值或已越过即起跳（沿助跑方向）");
@@ -168,16 +183,12 @@ public sealed class MainWindow : Window
         DrawFloat("转向对准 rad", "##facing",
             () => Service.Config.FacingToleranceRad, v => Service.Config.FacingToleranceRad = v, 0.001f, 0f, 0.1f,
             "朝向偏差小于此值视为已对准（0.001 ≈ 0.057°；键盘转向过冲达不到时放宽）");
-
-        ImGui.Separator();
         DrawFloat("落地成功判定 m", "##landtol",
             () => Service.Config.LandTolerance, v => Service.Config.LandTolerance = v, 0.01f, 0f, 2f,
             "落点距目标 ≤ 此值=成功，直接进下一段");
         DrawFloat("落地走位对齐上限 m", "##landwalk",
             () => Service.Config.LandWalkDist, v => Service.Config.LandWalkDist = v, 0.05f, 0.5f, 5f,
             "落点偏差 ≤ 此值自动走位对齐；超出=掉出平台，直接失败（不回起点重试，回跳无意义）");
-
-        ImGui.Separator();
         DrawFloat("起跳累计上升 m", "##takedy",
             () => Service.Config.TakeoffDeltaY, v => Service.Config.TakeoffDeltaY = v, 0.01f, 0.01f, 1f,
             "跳跃判定：离地高度累计超过此值视为起跳");
@@ -188,8 +199,15 @@ public sealed class MainWindow : Window
             () => Service.Config.DescendEndDeltaY, v => Service.Config.DescendEndDeltaY = v, 0.001f, 0f, 0.2f,
             "下落阶段单帧下降 ≤ 此值=已落地（结束滞空进落地校验）");
 
-        ImGui.Separator();
-        ImGui.Text("时间线预助跑（起点速度对齐）");
+        ImGui.Spacing();
+        DrawFloat("段间行走分流阈值 m", "##longwalk",
+            () => Service.Config.LongWalkDist, v => Service.Config.LongWalkDist = v, 0.1f, 0.5f, 20f,
+            "落点→下一起跳点位移超过此值=长路径段（交玩家手动走，到位后自动继续）；短路径段自动衔接");
+        DrawFloat("到位稳定确认 ms", "##awaitstable",
+            () => Service.Config.AwaitStableMs, v => Service.Config.AwaitStableMs = v, 10f, 0f, 5000f,
+            "到达起跳点附近后基本静止持续此时间才继续（防路过误触发）");
+
+        ImGui.Spacing();
         DrawFloat("预助跑速度阈值 m/s", "##prunemin",
             () => Service.Config.PreRunSpeedMin, v => Service.Config.PreRunSpeedMin = v, 0.01f, 0f, 1f,
             "时间线起点速度低于此值=原地跳/微调跳，不预助跑直接重放（主流段，164/166）");
@@ -202,6 +220,44 @@ public sealed class MainWindow : Window
         DrawFloat("达标兜底 m", "##pruneover",
             () => Service.Config.PreRunOvershoot, v => Service.Config.PreRunOvershoot = v, 0.05f, 0f, 2f,
             "越过时间线起点此距离仍未达标→强制开始时间线（防卡死；速度过低会止损失败并诊断）");
+
+        ImGui.Separator();
+
+        // ===== 当前模式设置（线性/碎片互相独立，显示当前模式） =====
+        ImGui.Text($"模式专用设置（当前：{Service.Config.SegmentMode switch
+        {
+            SegmentMode.Linear => "线性",
+            SegmentMode.Fragment => "碎片",
+            _ => "线性"
+        }}）");
+        if (Service.Config.SegmentMode == SegmentMode.Linear)
+        {
+            DrawFloat("线性·Y 对齐容差 m", "##yalign_lin",
+                () => Service.Config.YAlignTolerance, v => Service.Config.YAlignTolerance = v, 0.01f, 0f, 1f,
+                "读档起点高度匹配/到位判定/重录校验——线性下一段是一定的，可容忍较大容差（默认 0.3，路不平放宽，平整调小）");
+            DrawFloat("线性·插入段高度差 m", "##insegalign",
+                () => Service.Config.InsertSegmentYAlign, v => Service.Config.InsertSegmentYAlign = v, 0.01f, 0f, 1f,
+                "「插入新段」找就近起跳点时，|当前位置 Y − 起跳点 Y| ≤ 此值才视为候选");
+        }
+        else
+        {
+            DrawFloat("碎片·Y 对齐容差 m", "##yalign_frag",
+                () => Service.Config.FragYAlignTolerance, v => Service.Config.FragYAlignTolerance = v, 0.01f, 0f, 1f,
+                "碎片多起跳点近场易混淆，必须收紧以免多个点混淆距离计算（默认 0.2，与线性独立）");
+            DrawFloat("碎片·水平衔接距离 m", "##fragxz",
+                () => Service.Config.FragLinkDistXZ, v => Service.Config.FragLinkDistXZ = v, 0.5f, 0f, 30f,
+                "本段落点 → 下一起跳点水平距离 ≤ 此值才自动衔接；超过即认为附近无可衔接段，自动终止等手动读档");
+            DrawFloat("碎片·垂直衔接距离 m", "##fragy",
+                () => Service.Config.FragLinkDistY, v => Service.Config.FragLinkDistY = v, 0.1f, 0f, 5f,
+                "本段落点 → 下一起跳点 |ΔY| ≤ 此值才自动衔接——Y 高度绝不忽略（默认 1m）");
+        }
+    }
+
+    /// <summary>切换游戏操作模式（MoveMode：0=标准 1=传统），写游戏配置立即生效。</summary>
+    private static void SwitchMoveMode(uint want)
+    {
+        Service.GameConfig.UiControl.Set("MoveMode", want);
+        Service.ChatGui.Print(want == 1 ? "已切换为传统操作模式" : "已切换为标准操作模式");
     }
 
     private static void DrawFloat(string label, string id, Func<float> get, Action<float> set,

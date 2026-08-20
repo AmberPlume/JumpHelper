@@ -8,7 +8,7 @@ namespace JumpHelper;
 
 /// <summary>
 /// 跳跳乐助手（内部名称 JumpHelper）：录制玩家真实跳跃（全量输入时间线）→ 读档逐段回放。
-/// 日常操作全在悬浮窗（记录/保存/路线列表/段落编辑/执行/标定跳）；
+/// 日常操作全在悬浮窗（记录/保存/路线列表/段落编辑/路线回放）；
 /// 设置窗口为参数/开关配置。命令仅保留 /jh on | off（控制悬浮窗显示）。
 /// </summary>
 public sealed class JumpHelper : IDalamudPlugin

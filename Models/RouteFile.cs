@@ -3,6 +3,21 @@ using System.Numerics;
 namespace JumpHelper.Models;
 
 /// <summary>
+/// 段落记录方式（回放如何决定"下一步跳哪一段"）：
+/// 分散地图（先去左边跳一小段、再去右边跳一小段）的段落不构成线性递增路径，需按距离衔接。
+/// </summary>
+public enum SegmentMode
+{
+    /// <summary>线性（当前）：按序号顺序依次跳跃（段列表索引 +1 为下一步）。</summary>
+    Linear = 0,
+
+    /// <summary>碎片：段落有序号但仅作"名字"，不依赖序号；落地后按"落点→某段起跳点"的水平距离
+    /// （≤ FragLinkDistXZ）与高度（|ΔY| ≤ FragLinkDistY）自动衔接下一步；
+    /// 岔路（多候选）时暂停让玩家选；找不出"可衔接"的下阶段即终止。Y 高度绝不忽略。</summary>
+    Fragment = 1
+}
+
+/// <summary>
 /// 一个路线文件：绑定到指定地图（TerritoryId）的跳跃段集合。
 /// 录制时插件自动采集玩家真实跳跃的"起跳点→落点"段（Segments），
 /// 玩家用 rec node 在关键落点"打标"（Markers）以便选择回放起终点。
@@ -18,6 +33,12 @@ public class RouteFile
 
     /// <summary>录制地图名（列表显示用；旧路线无此字段则显示 TerritoryId 数字）。</summary>
     public string? TerritoryName { get; set; }
+
+    /// <summary>
+    /// 路线使用的段落记录方式（线性/碎片）。旧路线（无此字段）默认 = 线性，完全兼容。
+    /// 碎片路线回放时按距离/高度自动衔接段落，线性路线按序号顺序跳。
+    /// </summary>
+    public SegmentMode SegmentMode { get; set; } = SegmentMode.Linear;
 
     /// <summary>录制时的操作模式（0=标准 modern，1=传统 legacy）——读档一致性检测用。
     /// 输入（sumLeft/sumForward）语义依赖模式：标准=相对角色朝向（回放可复现）；传统=相对相机方位

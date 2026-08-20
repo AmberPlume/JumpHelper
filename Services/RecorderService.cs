@@ -8,7 +8,7 @@ namespace JumpHelper.Services;
 
 /// <summary>
 /// 录制服务（段采集模型）：进入录制模式后，插件在后台监听玩家的"起跳/落地"，
-/// 自动采集每次跳跃的"起跳点 → 落点"段；玩家在关键落点执行 rec node 打标，
+/// 自动采集每次跳跃的"起跳点 → 落点"段；玩家在关键落点 rec node 打标，
 /// 以便回放时选择起终点。
 ///
 /// 录制流程：
@@ -78,6 +78,11 @@ public sealed class RecorderService : IDisposable
     /// <summary>重录中的段索引（-1 = 无）：段落编辑「重录」移除该段后，玩家重新跳这一跳，
     /// 落地采集的新段 Insert 回原序号位置（只替换当前段，不丢弃后续段）；-1 = 正常 Append。</summary>
     private int _rerecordIndex = -1;
+
+    /// <summary>插入新段的插入位置（-1 = 无）：段落编辑「插入新段」（仅线性模式）时，以就近落点段
+    /// （同高度最近）为基准，其后的段序号（基准段索引 + 1）即插入点；玩家跳一跳，落地新段
+    /// Insert 到此位置（后续段顺延），解决"段 12 变段 11 后无法补录段 11"的补段需求。</summary>
+    private int _insertIndex = -1;
 
     // 起跳/落地（全部由游戏跳跃状态标志 ConditionFlag.Jumping 判定；Y 阈值判据已弃——爬坡误判）
     private const long PendingTimeoutMs = 3000; // 起跳点 3s 未落地（标志未清除）= 异常，丢弃
@@ -159,10 +164,12 @@ public sealed class RecorderService : IDisposable
             Name = name,
             TerritoryId = Service.ClientState.TerritoryType,
             TerritoryName = ResolveTerritoryName(Service.ClientState.TerritoryType),
-            ControlMode = _movement.IsLegacyMode ? 1 : 0 // 录制模式：输入语义依赖操作模式，读档一致性检测用
+            ControlMode = _movement.IsLegacyMode ? 1 : 0, // 录制模式：输入语义依赖操作模式，读档一致性检测用
+            SegmentMode = Service.Config.SegmentMode // 记录当前段落方式（线性/碎片），持久化供回放参考
         };
         _recordingActive = false; // 新建=已建未录，点「记录开始」才采集
         _rerecordIndex = -1;
+        _insertIndex = -1;
         _pendingExtended = null;
         _pendingTakeoff = null;
         _pendingSince = 0;
@@ -180,7 +187,7 @@ public sealed class RecorderService : IDisposable
     }
 
     /// <summary>
-    /// 加载已保存路线，恢复可记录状态（可继续「记录开始」追加段/打标，或选起终点「读档」跳回）。
+    /// 加载已保存路线，恢复可记录状态（可继续「记录开始」追加段/打标，或选起终点段后点悬浮窗「路线回放」读档跳回）。
     /// 若当前已有路线（记录中/已建未录），先自动保存再切换（便于随时切换路线）。
     /// </summary>
     public bool LoadRouteForRecord(string name)
@@ -202,6 +209,18 @@ public sealed class RecorderService : IDisposable
             return false;
         }
 
+        // 段落方式自动切换：路线绑定录制时的段落方式（线性按序号、碎片按距离衔接），
+        // 模式不符时自动切到路线模式（不再阻止——玩家无需手动切换，切换会卸载旧路线由悬浮窗 Draw 处理）
+        if (route.SegmentMode != Service.Config.SegmentMode)
+        {
+            var routeMode = route.SegmentMode == SegmentMode.Linear ? "线性" : "碎片";
+            var curMode = Service.Config.SegmentMode == SegmentMode.Linear ? "线性" : "碎片";
+            Service.Config.SegmentMode = route.SegmentMode;
+            Service.Config.Save();
+            PluginLog.Info($"加载路线「{name}」：段落方式 {curMode} → {routeMode}（自动切换）");
+            Service.ChatGui.Print($"当前路线为{routeMode}模式，已自动切换");
+        }
+
         // 非当前地图阻止：路线绑定录制地图，加载非当前地图的路线必然回放失败（Territory 校验不过），
         // 且容易误以为是插件故障——直接阻止并提示需先传送到录制地图
         if (route.TerritoryId != Service.ClientState.TerritoryType)
@@ -216,6 +235,7 @@ public sealed class RecorderService : IDisposable
         _current = route;
         _recordingActive = false;
         _rerecordIndex = -1;
+        _insertIndex = -1;
         _pendingExtended = null;
         _pendingTakeoff = null;
         _pendingSince = 0;
@@ -227,10 +247,31 @@ public sealed class RecorderService : IDisposable
         _posHistory.Clear();
         _inputHistory.Clear();
         _prevY = Service.ObjectTable.LocalPlayer?.Position.Y ?? 0f;
-        CheckControlMode(route);
+        // 操作模式自动切换：输入（sumLeft/sumForward）语义依赖录制时的操作模式（标准=相对角色朝向可复现；
+        // 传统=相对相机不可复现），加载时自动切到录制模式（写游戏配置 MoveMode 立即生效），避免回放方向偏差。
+        // 副作用：会改变玩家当前操作模式，回放结束后不会自动切回——聊天提示已说明。
+        var wantControl = route.ControlMode == 1 ? 1u : 0u;
+        if (Service.GameConfig.UiControl.TryGetUInt("MoveMode", out var curMoveMode) && curMoveMode != wantControl)
+        {
+            try
+            {
+                Service.GameConfig.UiControl.Set("MoveMode", wantControl);
+                var modeName = wantControl == 1 ? "传统" : "标准";
+                PluginLog.Info($"加载路线「{name}」：操作模式 {curMoveMode} → {wantControl}（自动切换为{modeName}模式）");
+                Service.ChatGui.Print($"已自动切换为{modeName}操作模式，可在设置中切回");
+            }
+            catch (Exception ex)
+            {
+                var curName = curMoveMode == 1 ? "传统" : "标准";
+                var recName = route.ControlMode == 1 ? "传统" : "标准";
+                Service.Log.Error(ex, $"操作模式自动切换失败（MoveMode {curMoveMode} → {wantControl}）");
+                Service.ChatGui.PrintError($"操作模式不一致：当前{curName}模式，该路线录制为{recName}——请在设置中手动切换");
+            }
+        }
+        CheckControlMode(route); // 兜底：切换失败时仅日志
         CheckMoveStateWarning(route);
         PluginLog.Info($"已加载路线「{name}」（{route.Segments.Count} 段）——" +
-                   $"点「记录开始」继续记录，或选起终点段后「读档」跳回");
+                   $"点「记录开始」继续记录，或选起终点段后点悬浮窗「路线回放」读档跳回");
         return true;
     }
 
@@ -266,9 +307,8 @@ public sealed class RecorderService : IDisposable
         }
     }
 
-    /// <summary>操作模式一致性检测：录制时模式（ControlMode）与当前模式不一致 → 警告。
-    /// 输入（sumLeft/sumForward）语义依赖模式（标准=相对角色朝向可复现；传统=相对相机不可复现），
-    /// 混合模式录制/回放方向必偏——用户曾两种模式轮流操作造成污染，读档时提醒。</summary>
+    /// <summary>操作模式一致性检测：录制时模式（ControlMode）与当前模式不一致 → 仅记录日志。
+    /// 加载路线时已自动切到录制模式（MoveMode），此处仅兜底记录——正常情况下不会触发。</summary>
     private void CheckControlMode(RouteFile route)
     {
         var cur = _movement.IsLegacyMode ? 1 : 0;
@@ -276,9 +316,7 @@ public sealed class RecorderService : IDisposable
             return;
         var modeName = cur == 1 ? "传统" : "标准";
         var recName = route.ControlMode == 1 ? "传统" : "标准";
-        Service.ChatGui.PrintError($"操作模式警告：当前是{modeName}模式，但该路线录制时是{recName}模式——输入语义不同，" +
-                                   $"回放方向会偏差。请切回{recName}模式（建议统一用标准模式录制/回放）");
-        PluginLog.Info($"操作模式不一致：当前 {modeName} vs 录制 {recName}——回放方向可能偏差（建议统一标准模式）");
+        PluginLog.Info($"操作模式不一致（兜底）：当前 {modeName} vs 录制 {recName}——玩家可能手动改回，回放方向可能偏差");
     }
 
     /// <summary>
@@ -301,7 +339,7 @@ public sealed class RecorderService : IDisposable
         _recordingActive = true;
         _pendingTakeoff = null;
         _flagLandPending = false;
-        Service.ChatGui.Print($"记录开始——后续跳跃将自动采集为段（路线：{_current.Name}）");
+        Service.ChatGui.Print($"记录开始（路线：{_current.Name}）");
         PluginLog.Info("记录开始——后续跳跃将自动采集为段");
 
         // 录制防呆：带移速加成录制 → 起跳速度偏高，路线只能在相同状态下回放（状态必须一致，
@@ -309,7 +347,7 @@ public sealed class RecorderService : IDisposable
         var moveState = MoveStatusHelper.DetectCurrentState();
         if (moveState != MoveState.None)
         {
-            ChatInfo($"当前带{MoveStatusHelper.StateName(moveState)}状态，路线将按此状态录制，回放需同状态");
+            ChatInfo($"当前带有影响速度的状态，路线将按照此状态录制，回放时需相同状态。请留意。");
             PluginLog.Info($"录制开始带移速状态 {MoveStatusHelper.StateName(moveState)}——路线将按该状态录制");
         }
         return true;
@@ -364,16 +402,20 @@ public sealed class RecorderService : IDisposable
         var isExt = seg.Extended == true; // 扩展段：重录需从行走起点（StartPos）开始
         var anchorY = isExt ? seg.StartY : seg.TakeoffY;
         var anchorLabel = isExt ? "行走起点" : "起跳点";
-        if (MathF.Abs(player.Position.Y - anchorY) > Service.Config.YAlignTolerance) // 与回放引擎 Y 对齐容差一致（路不平地图默认 0.3m）
+        var yAlign = Service.Config.SegmentMode == SegmentMode.Fragment
+            ? Service.Config.FragYAlignTolerance
+            : Service.Config.YAlignTolerance;
+        if (MathF.Abs(player.Position.Y - anchorY) > yAlign) // 与当前模式 Y 对齐容差一致
         {
-            PluginLog.Error($"重录失败：玩家 Y {player.Position.Y:F2} vs 段{segmentIndex + 1} {anchorLabel} Y {anchorY:F2}（差 >0.01m）——请先到该段{anchorLabel}所在平台");
-            Service.ChatGui.PrintError($"重录失败：请先到段 {segmentIndex + 1} {anchorLabel}所在平台（Y 轴需一致）");
+            PluginLog.Error($"重录失败：玩家 Y {player.Position.Y:F2} vs 段{segmentIndex + 1} {anchorLabel} Y {anchorY:F2}（差 >{yAlign:F2}m）——请先到该段{anchorLabel}所在平台");
+            Service.ChatGui.PrintError($"当前位置与段 {segmentIndex + 1} {anchorLabel}距离过远，无法重录，请走到要重录的段附近");
             return false;
         }
 
         // 只移除该段（后续段保留），记录重录索引与扩展标记
         _current.Segments.RemoveAt(segmentIndex);
         _rerecordIndex = segmentIndex;
+        _insertIndex = -1; // 重录与插入互斥（插入用 _insertIndex）
         _pendingExtended = seg.Extended; // 扩展段重录按扩展（时间线覆盖行走起点）；否则短时间线
 
         // 进入记录状态：扩展段从行走起点开始走+跳，短段从起跳点跳，落地后自动替换回原位置
@@ -412,10 +454,80 @@ public sealed class RecorderService : IDisposable
     }
 
     /// <summary>
-    /// 读档跳回（记录中使用）：丢弃"终点段之后"的废段，然后从起点段回放到终点段
+    /// 插入新段（仅线性模式）：以"就近落点段"（同平台 = XZ 最近且 |Y差| ≤ YAlignTolerance 的段）为基准，
+    /// 在它之后插入一个占位段——玩家跳一跳，落地采集的新段会 Insert 到基准段的下一位（后续段顺延）。
+    /// 解决"直接删掉段 N → 段 N+1 变为段 N → 无法补录原 N 段"的问题（补录即以最近的落点段为基准插入其后）。
+    /// 与重录不同：重录替换原序号、后续段保留；插入是在任意位置补一段、后续段顺延。
+    /// </summary>
+    public bool InsertNewSegment()
+    {
+        if (_current == null || _current.Segments.Count == 0)
+        {
+            Service.ChatGui.PrintError("无路线或尚无段");
+            return false;
+        }
+        // 仅线性模式支持插入（部分模式段落无序号、由距离衔接，插入无意义）
+        if (Service.Config.SegmentMode != SegmentMode.Linear)
+        {
+            Service.ChatGui.PrintError("插入新段仅线性模式可用");
+            return false;
+        }
+
+        var player = Service.ObjectTable.LocalPlayer;
+        if (player == null)
+            return false;
+
+        // 就近落点段：XZ 最近且同平台（|Y差| ≤ InsertSegmentYAlign，线性模式独享设置项）
+        int baseIndex = -1;
+        var baseD = float.MaxValue;
+        for (int i = 0; i < _current.Segments.Count; i++)
+        {
+            var land = _current.Segments[i].Land;
+            if (MathF.Abs(land.Y - player.Position.Y) > Service.Config.InsertSegmentYAlign)
+                continue;
+            var dx = land.X - player.Position.X;
+            var dz = land.Z - player.Position.Z;
+            var d = dx * dx + dz * dz;
+            if (d < baseD)
+            {
+                baseD = d;
+                baseIndex = i;
+            }
+        }
+        if (baseIndex < 0)
+        {
+            PluginLog.Error($"插入新段失败：就近无同平台落点段（|Y差|≤{Service.Config.InsertSegmentYAlign:F2}m）——请靠近要插入位置前的段落点");
+            Service.ChatGui.PrintError("当前位置与任一段落地点距离过远，无法插入，请走到要插入的段的落地点附近");
+            return false;
+        }
+        if (baseIndex < 0 || baseIndex >= _current.Segments.Count)
+            return false;
+
+        // 在基准段之后插入（baseIndex+1 = 下一段序号）
+        _insertIndex = baseIndex + 1;
+        _rerecordIndex = -1; // 重录与插入互斥
+        _pendingExtended = null;
+        _recordingActive = true;
+        _pendingTakeoff = null;
+        _flagLandPending = false;
+        _paused = false;
+        _lastLandAt = long.MinValue;
+        _lastLandPos = null;
+        _posHistory.Clear();
+        _inputHistory.Clear();
+        _prevY = player.Position.Y;
+        _wasJumping = Service.Condition[ConditionFlag.Jumping];
+
+        PluginLog.Info($"插入新段：以就近落点段 #{baseIndex + 1} 为基准——下一跳将记录为段 #{_insertIndex + 1}（原 #{_insertIndex + 1} 起顺延）");
+        ChatInfo($"在段{baseIndex + 1}后插入段落，下一次跳跃将记录为段{_insertIndex + 1}");
+        return true;
+    }
+
+    /// <summary>
+    /// 执行（记录中使用）：丢弃"终点段之后"的废段，然后从起点段回放到终点段
     /// （跳跃，非直线走位——跳跳乐地形直线不可达）。回放期间采集自动暂停（OnUpdate 检查
     /// ReplayEngine.State），到位后恢复。玩家需自行到达起点段起跳点所在平台（高度匹配检查）。
-    /// 纯跳回（不丢弃）用 ReplayEngine.StartRouteSegments（段表格/悬浮窗「执行」）。
+    /// 纯跳回（不丢弃）用 ReplayEngine.StartRouteSegments（段表格/悬浮窗「路线回放」）。
     /// </summary>
     public bool LoadFromSegment(int startSegment, int endSegment)
     {
@@ -450,6 +562,7 @@ public sealed class RecorderService : IDisposable
         _pendingTakeoff = null;
         _lastLandAt = long.MinValue;
         _rerecordIndex = -1;
+        _insertIndex = -1;
         _pendingExtended = null;
         _paused = false; // 读档=回到已走位置继续录，恢复采集（回放期间由 ReplayEngine.State 自动挡住）
         _wasJumping = Service.Condition[ConditionFlag.Jumping]; // 读档后回放跳跃期间采集被挡住；回放结束玩家继续跳，边沿对齐当前状态
@@ -486,6 +599,7 @@ public sealed class RecorderService : IDisposable
         _current = null;
         _recordingActive = false;
         _rerecordIndex = -1;
+        _insertIndex = -1;
         _pendingExtended = null;
         _pendingTakeoff = null;
         _paused = false;
@@ -502,6 +616,7 @@ public sealed class RecorderService : IDisposable
         _current = null;
         _recordingActive = false;
         _rerecordIndex = -1;
+        _insertIndex = -1;
         _pendingExtended = null;
         _pendingTakeoff = null;
         _paused = false;
@@ -517,9 +632,23 @@ public sealed class RecorderService : IDisposable
         if (_current == null)
             return;
 
+        var territory = Service.ClientState.TerritoryType;
+
+        // 切换地图自动卸载：带着地图A的路线切到地图B → 路线已不可用（加载时 Territory 校验阻止，
+        // 回放起点校验也会拦），自动卸载 + 提示，防止玩家误以为路线还在
+        if (_lastTerritory != 0 && _lastTerritory != territory && _current.TerritoryId != territory)
+        {
+            var routeMap = ResolveTerritoryName(_current.TerritoryId) ?? $"地图 {_current.TerritoryId}";
+            var routeName = _current.Name;
+            PluginLog.Info($"离开路线地图（{_lastTerritory} → {territory}），自动卸载路线「{routeName}」（录制于 {routeMap}）");
+            Service.ChatGui.Print($"已离开路线地图（{routeMap}），自动卸载路线「{routeName}」");
+            UnloadRoute(); // 卸载前自动保存（跟随 AutoSaveEvery 开关）
+            _lastTerritory = territory;
+            return;
+        }
+
         // 地图切换自动暂停：录制中传送/换图（如测试传送到别处再回来）→ 自动暂停采集，
         // 回程/途中跳跃不录入。传回跳跳乐地图后需手动恢复（/ja rec pause 或 UI 按钮）。
-        var territory = Service.ClientState.TerritoryType;
         if (_lastTerritory != 0 && _lastTerritory != territory && _recordingActive)
         {
             _paused = true;
@@ -687,7 +816,7 @@ public sealed class RecorderService : IDisposable
             _pendingTakeoff = null;
             _flagLandPending = false;
             _paused = true; // 自动暂停：跌落段丢弃后不再采集，玩家回位后手动恢复
-            Service.ChatGui.PrintError($"检测到跌落段（高差 {landY - takeoffY:F2}m）——已丢弃且自动暂停记录，回到起点后点「继续记录」");
+            Service.ChatGui.PrintError($"检测到跌落段（高差 {landY - takeoffY:F2}m），已丢弃并暂停——回到起点后点「继续记录」");
             PluginLog.Info($"跌落段已按设置丢弃并自动暂停（高差 {landY - takeoffY:F2}m < -{Service.Config.FellDropHeight:F1}m）——" +
                        $"起跳({dropTakeoff.X:F2},{dropTakeoff.Y:F2},{dropTakeoff.Z:F2})");
             return;
@@ -723,7 +852,8 @@ public sealed class RecorderService : IDisposable
             StartSpeed = _segmentStartSpeed,
             Inputs = BuildInputs()
         };
-        // 正常记录 = Append 到末尾；重录 = Insert 回原序号位置（只替换该段，后续段保留），并自动停止记录
+        // 正常记录 = Append 到末尾；重录 = Insert 回原序号位置（只替换该段，后续段保留），并自动停止记录。
+        // 插入新段 = Insert 到指定位置（基准段之后），后续段顺延，并自动停止记录。
         if (_rerecordIndex >= 0)
         {
             var idx = Math.Min(_rerecordIndex, _current.Segments.Count);
@@ -733,6 +863,16 @@ public sealed class RecorderService : IDisposable
             _recordingActive = false; // 重录完成：停止记录（后续跳跃不再采集，避免与保留的后续段混淆）
             PluginLog.Info($"重录完成：段 #{idx + 1} 已替换（新段 Insert 原序号，其余段保留），已停止记录");
             ChatInfo($"段 {idx + 1} 重录完成");
+        }
+        else if (_insertIndex >= 0)
+        {
+            var idx = Math.Min(_insertIndex, _current.Segments.Count);
+            _current.Segments.Insert(idx, segment);
+            _insertIndex = -1;
+            _pendingExtended = null;
+            _recordingActive = false; // 插入完成：停止记录（新段已补入，原该序号起顺延）
+            PluginLog.Info($"插入完成：段 #{idx + 1} 已插入（原 #{idx + 1} 起顺延），已停止记录");
+            ChatInfo($"段 {idx + 1} 插入完成");
         }
         else
         {
@@ -750,7 +890,7 @@ public sealed class RecorderService : IDisposable
         if (saveEvery > 0 && _current.Segments.Count % saveEvery == 0)
         {
             _store.Save(_current);
-            Service.ChatGui.Print($"自动保存：{_current.Name}（{_current.Segments.Count} 段，每 {saveEvery} 跳一次）");
+            Service.ChatGui.Print("已自动保存路线");
         }
         _pendingTakeoff = null;
         _flagLandPending = false;
